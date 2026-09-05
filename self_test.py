@@ -391,6 +391,67 @@ def test_message_block_is_rewrapped_into_windows() -> None:
                      "no words lost or duplicated")
 
 
+def test_glossary_only_string_is_substituted_without_api() -> None:
+    """Регрессия: имя говорящего целиком из глоссария оставалось непереведённым.
+
+    В MZ имя говорящего лежит в params[4] команды 101 и часто равно ровно одному
+    термину («Rin»). Такая строка не должна уходить в переводчик — там от неё
+    остаётся один плейсхолдер, — но подставить целевую форму всё равно обязана.
+    """
+    with tempfile.TemporaryDirectory() as td:
+        data_dir = Path(td)
+        (data_dir / "Map001.json").write_text(json.dumps({
+            "events": [None, {"id": 1, "name": "E", "pages": [{"list": [
+                {"code": 101, "indent": 0, "parameters": ["", 0, 0, 2, "Rin"]},
+                {"code": 401, "indent": 0, "parameters": ["Hello there."]},
+                {"code": 0, "indent": 0, "parameters": []},
+            ]}]}],
+        }), encoding="utf-8")
+
+        glossary = Glossary()
+        glossary.add("Rin", "Рин")
+        project = RPGMakerProject(data_dir, glossary=glossary)
+        entries = project.extract_all()
+
+        speaker = [e for e in entries if e.path[-1] == 4][0]
+        assert_equal(speaker.needs_translation, False, "pure glossary term skips the API")
+
+        line = [e for e in entries if e.is_message][0]
+        project.apply_translations({entries.index(line): "Здравствуйте."})
+
+        data = json.loads((data_dir / "Map001.json").read_text(encoding="utf-8"))
+        commands = data["events"][1]["pages"][0]["list"]
+        assert_equal(commands[0]["parameters"][4], "Рин", "speaker name substituted")
+        assert_equal(commands[1]["parameters"][0], "Здравствуйте.", "line translated")
+
+
+def test_rebuild_keeps_custom_command_fields() -> None:
+    """Регрессия: пересборка окон теряла служебные поля команд (_original)."""
+    with tempfile.TemporaryDirectory() as td:
+        data_dir = Path(td)
+        (data_dir / "Map001.json").write_text(json.dumps({
+            "events": [None, {"id": 1, "name": "E", "pages": [{"list": [
+                {"code": 101, "indent": 0, "parameters": ["", 0, 0, 2, ""]},
+                {"code": 401, "indent": 0, "parameters": ["First half"],
+                 "_original": "前半"},
+                {"code": 401, "indent": 0, "parameters": ["second half."],
+                 "_original": "後半。"},
+                {"code": 0, "indent": 0, "parameters": []},
+            ]}]}],
+        }), encoding="utf-8")
+
+        project = RPGMakerProject(data_dir)
+        entries = project.extract_all()
+        index = entries.index([e for e in entries if e.is_message][0])
+        project.apply_translations({index: "Первая половина, вторая половина."})
+
+        data = json.loads((data_dir / "Map001.json").read_text(encoding="utf-8"))
+        lines = [c for c in data["events"][1]["pages"][0]["list"] if c["code"] == 401]
+        originals = [c["_original"] for c in lines if "_original" in c]
+        assert_equal(len(originals), 1, "metadata attached once, to the first line")
+        assert_equal(originals[0], "前半\n後半。", "both originals preserved in order")
+
+
 # ────────────────────────────────────────────────────────────────────────────
 # Безопасность путей
 # ────────────────────────────────────────────────────────────────────────────
@@ -486,6 +547,8 @@ TESTS = [
     test_project_write_keeps_system_markers,
     test_script_reference_ignores_comments,
     test_message_block_is_rewrapped_into_windows,
+    test_glossary_only_string_is_substituted_without_api,
+    test_rebuild_keeps_custom_command_fields,
     test_output_dir_guard,
     test_runtime_text_wrap_installer,
 ]

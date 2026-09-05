@@ -427,6 +427,7 @@ class TextEntry:
     is_dialogue: bool = False       # это часть диалога (для контекстной склейки)
     needs_translation: bool = True  # False = техническая строка, пропускаем переводчик
     block: MessageBlock | None = None   # для сообщений: путь ведёт к списку команд
+    raw: str = ""                   # исходный текст до защиты кодов
 
     @property
     def is_message(self) -> bool:
@@ -591,15 +592,17 @@ class RPGMakerProject:
             )
         protected, codes = protect_codes(raw_text, self.glossary)
 
-        # Технические строки: после удаления кодов остался только мусор —
-        # пробелы, знаки препинания, цифры. Такие строки переводить нельзя —
-        # обычно это «header»-команды плагинов вроде \FFF[eriya9]\AA[FFF]\N<エリヤ>.
+        # Технические строки: после удаления кодов и терминов глоссария не
+        # осталось ничего, кроме пробелов, знаков препинания и цифр. Переводить
+        # такое нельзя и незачем: это либо «header»-команда плагина вроде
+        # \FFF[eriya9]\AA[FFF]\N<エリヤ>, либо имя говорящего, целиком закрытое
+        # глоссарием — иначе провайдер получил бы запрос из одного «<t0/>».
         #
-        # ВАЖНО: проверяем по ИСХОДНОМУ тексту (raw_text) с вырезанными кодами,
-        # а НЕ по protected. Потому что protected содержит html-эскейпы (&lt; &gt;
-        # &amp;), в которых есть латинские буквы lt/gt/amp — они дали бы ложное
+        # Считаем по ЗАЩИЩЁННОМУ тексту без плейсхолдеров: только так учитываются
+        # и управляющие коды, и глоссарий. clean_for_detection заодно снимает
+        # html-эскейпы, в которых есть латинские lt/gt/amp — они дали бы ложное
         # срабатывание «тут есть текст» на строках вида «\C[1] < >».
-        raw_without_codes = CONTROL_CODE_PATTERN.sub('', raw_text)
+        cleaned_for_check = clean_for_detection(protected)
         has_letters = bool(re.search(
             r'[A-Za-zА-Яа-яЁё'
             r'\u3040-\u309F'   # хирагана
@@ -607,7 +610,7 @@ class RPGMakerProject:
             r'\u4E00-\u9FFF'   # кандзи/китайские
             r'\uAC00-\uD7AF'   # хангыль
             r']',
-            raw_without_codes,
+            cleaned_for_check,
         ))
         needs_translation = (
             has_letters
@@ -618,7 +621,7 @@ class RPGMakerProject:
         self.entries.append(TextEntry(
             text=protected, codes=codes, file=file, path=path,
             group_id=group_id, is_dialogue=is_dialogue,
-            needs_translation=needs_translation, block=block,
+            needs_translation=needs_translation, block=block, raw=raw_text,
         ))
 
     def _extract_event_list(self, event_list: list, file: str, base_path: tuple) -> None:
@@ -1005,7 +1008,19 @@ class RPGMakerProject:
         by_file: dict[str, list[tuple[TextEntry, str]]] = {}
         messages: dict[str, dict[tuple, list[tuple[TextEntry, str]]]] = {}
 
-        for idx, translated in translations.items():
+        # Технические записи переводчику не отправлялись, но глоссарий мог
+        # заменить в них имя: параметр 4 команды 101 — это часто ровно «Rin»,
+        # то есть строка целиком из одного термина. Без этого шага имя
+        # говорящего так и осталось бы на языке оригинала.
+        pending = dict(translations)
+        for idx, entry in enumerate(self.entries):
+            if idx in pending or entry.needs_translation:
+                continue
+            substituted = restore_codes(entry.text, entry.codes)
+            if substituted != entry.raw:
+                pending[idx] = entry.text
+
+        for idx, translated in pending.items():
             if idx >= len(self.entries):
                 continue
             entry = self.entries[idx]
@@ -1092,6 +1107,11 @@ class RPGMakerProject:
             pages = self._layout_pages(text, block)
             header = (event_list[block.header_index]
                       if block.header_index is not None else None)
+            # Служебные ключи исходных команд (например, _original от прошлого
+            # прогона перевода) переносим на первую строку блока — заново
+            # созданные команды их иначе теряют.
+            extra = _merge_extra_keys(event_list[block.first:block.last + 1])
+            first = True
 
             for page_no, lines in enumerate(pages):
                 if header is not None:
@@ -1099,11 +1119,15 @@ class RPGMakerProject:
                     # тот же портрет, та же позиция, то же имя говорящего.
                     rebuilt.append(header if page_no == 0 else _clone_command(header))
                 for line in lines:
-                    rebuilt.append({
+                    command = {
                         "code": 401,
                         "indent": block.indent,
                         "parameters": [line],
-                    })
+                    }
+                    if first and extra:
+                        command.update(extra)
+                        first = False
+                    rebuilt.append(command)
 
             stats["rewrapped"] += 1
             if len(pages) > 1:
@@ -1125,6 +1149,35 @@ class RPGMakerProject:
         fitted = fit_message(text, self.measurer, has_face=block.has_face,
                              max_lines=max_lines)
         return fitted.pages
+
+
+_STANDARD_COMMAND_KEYS = {"code", "indent", "parameters"}
+
+
+def _merge_extra_keys(commands: list) -> dict:
+    """Нестандартные поля команд блока — их нельзя терять при пересборке.
+
+    Инструменты перевода и плагины дописывают к командам свои ключи
+    (в этих картах — `_original` с исходным японским текстом). Строки блока
+    после перевода перекомпонованы, поэтому привязать поле к конкретной строке
+    невозможно: строковые значения склеиваются в исходном порядке и кладутся
+    на первую строку — там они описывают всё сообщение целиком, как и раньше.
+    """
+    merged: dict[str, Any] = {}
+    parts: dict[str, list[str]] = {}
+    for cmd in commands:
+        if not isinstance(cmd, dict):
+            continue
+        for key, value in cmd.items():
+            if key in _STANDARD_COMMAND_KEYS:
+                continue
+            if isinstance(value, str):
+                parts.setdefault(key, []).append(value)
+            else:
+                merged.setdefault(key, value)
+    for key, values in parts.items():
+        merged[key] = "\n".join(values)
+    return merged
 
 
 def _clone_command(cmd: Any) -> Any:
