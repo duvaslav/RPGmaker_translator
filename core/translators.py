@@ -4,7 +4,6 @@
 """
 from __future__ import annotations
 
-import html as _html
 import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
@@ -14,18 +13,15 @@ if TYPE_CHECKING:
     from core.cache import TranslationCache
 
 
-def _unescape_html(text: str) -> str:
-    """Декодирует HTML-entities (&amp; → &, &lt; → <, &#39; → ' и т.д.).
+def _keep_entities(text: str) -> str:
+    """Ответ провайдера отдаётся дальше КАК ЕСТЬ, без расэкранирования.
 
-    Нужно потому что в html/HTML-режиме переводчики (DeepL, Yandex) экранируют
-    спецсимволы. После перевода надо вернуть их в исходный вид, иначе в игре
-    появятся artefacts вроде «&quot;» вместо кавычек.
-    Наши плейсхолдеры <t0/> при этом не страдают — они валидные теги."""
-    if not text:
-        return text
-    if "&" not in text:
-        return text  # быстрый путь: нет entities
-    return _html.unescape(text)
+    Раньше html-сущности расэкранировались дважды: здесь и в restore_codes.
+    Из-за этого строка, где в игре реально лежит «&amp;», превращалась в «&».
+    Теперь единственная точка расэкранирования — restore_codes, и она
+    вызывается ровно один раз за жизнь строки.
+    """
+    return text or ""
 
 
 @dataclass
@@ -34,9 +30,43 @@ class TranslationError(Exception):
     provider: str = ""
     recoverable: bool = True
     too_large: bool = False  # True = запрос превысил лимит размера, нужно разбить батч
+    retry_after: float = 0.0  # сколько ждать по требованию сервера (429)
 
     def __str__(self) -> str:
         return f"[{self.provider}] {self.message}"
+
+
+def _interruptible_sleep(seconds: float,
+                         should_stop: Callable[[], bool] | None = None) -> None:
+    """Пауза, которую можно прервать кнопкой «Остановить»."""
+    deadline = time.monotonic() + max(0.0, seconds)
+    while time.monotonic() < deadline:
+        if should_stop and should_stop():
+            return
+        time.sleep(min(0.25, deadline - time.monotonic()))
+
+
+def _retry_after(response) -> float:
+    """Читает заголовок Retry-After, если сервер его прислал."""
+    try:
+        value = response.headers.get("Retry-After", "")
+    except Exception:
+        return 0.0
+    try:
+        return min(120.0, max(0.0, float(value)))
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _placeholders_intact(source: str, translated: str) -> bool:
+    """Все ли плейсхолдеры <tN/> дожили до перевода в единственном экземпляре."""
+    from core.rpgmaker_parser import count_placeholders, validate_placeholders
+    expected = count_placeholders(source)
+    if not expected:
+        # Кодов не было — но чужой плейсхолдер мог переехать из соседней строки.
+        return not count_placeholders(translated)
+    ok, _ = validate_placeholders(translated, max(expected) + 1)
+    return ok
 
 
 class Translator(ABC):
@@ -168,7 +198,8 @@ class DeepLTranslator(Translator):
                 self.name, False,
             )
         if r.status_code == 429:
-            raise TranslationError("Rate limit DeepL — подожди немного", self.name, True)
+            raise TranslationError("Rate limit DeepL — подожди немного", self.name, True,
+                                   retry_after=_retry_after(r))
         if r.status_code != 200:
             raise TranslationError(
                 f"DeepL ответил {r.status_code}: {r.text[:200]}", self.name, True
@@ -182,7 +213,7 @@ class DeepLTranslator(Translator):
                 self.name, True,
             )
         # html-режим экранирует спецсимволы — декодируем обратно
-        return [_unescape_html(t.get("text", "")) for t in translations]
+        return [_keep_entities(t.get("text", "")) for t in translations]
 
 
 # ────────────────────────────────────────────────────────────────────────────
@@ -194,9 +225,8 @@ class GoogleTranslator_(Translator):
 
     def __init__(self, api_key: str = ""):
         # ключ не нужен, но параметр оставлен для единообразия
-        try:
-            from deep_translator import GoogleTranslator  # noqa: F401
-        except ImportError:
+        import importlib.util
+        if importlib.util.find_spec("deep_translator") is None:
             raise TranslationError(
                 "Установи пакет: pip install deep-translator",
                 self.name, False,
@@ -310,7 +340,8 @@ class YandexTranslator(Translator):
                 self.name, recoverable=True, too_large=True,
             )
         if r.status_code == 429:
-            raise TranslationError("Rate limit Yandex", self.name, True)
+            raise TranslationError("Rate limit Yandex", self.name, True,
+                                   retry_after=_retry_after(r))
         if r.status_code != 200:
             raise TranslationError(
                 f"Yandex ответил {r.status_code}: {r.text[:200]}",
@@ -377,7 +408,7 @@ class YandexTranslator(Translator):
                 self.name, True,
             )
         # format=HTML экранирует спецсимволы — декодируем обратно
-        return [_unescape_html(t.get("text", "")) for t in translations]
+        return [_keep_entities(t.get("text", "")) for t in translations]
 
     def _translate_split(self, texts: list[str], src: str, dst: str) -> list[str]:
         """Рекурсивно делит батч пополам, пока куски не станут достаточно мелкими.
@@ -416,7 +447,7 @@ class YandexTranslator(Translator):
         """Переводит одну строку, которая сама по себе превышает лимит.
         Режем по предложениям/переносам, переводим частями, склеиваем.
         Это крайний случай — обычно строки RPG Maker короткие."""
-        import re as _re
+
         # Точки разреза: переносы строк, потом японские/латинские концы предложений
         # Стараемся не резать внутри плейсхолдера <tN/>.
         chunk_limit = self.MIN_SPLIT_CHARS
@@ -552,6 +583,7 @@ def translate_with_chain(
     wait_if_paused: Callable[[], None] | None = None,
     cache: "TranslationCache | None" = None,
     save_cache_every: int = 1,
+    stats: dict | None = None,
 ) -> list[str]:
     """
     Прогоняет тексты через все стадии цепочки.
@@ -570,10 +602,15 @@ def translate_with_chain(
     current = list(texts)
     current_contexts = list(contexts) if contexts is not None else [""] * len(current)
     stages = cfg.route.stages()
+    rejected = 0
+    stage_count = len(stages)
 
     for stage_idx, (src, dst) in enumerate(stages):
         provider_name, api_key, extra_kwargs = cfg.get_stage(stage_idx)
         translator = make_translator(provider_name, api_key, **extra_kwargs)
+        # Кэш привязывается к провайдеру ИМЕННО ЭТОЙ стадии: в цепочке
+        # JP→EN Google, EN→RU DeepL это два независимых набора переводов.
+        stage_cache = cache.for_provider(provider_name) if cache is not None else None
         stage_label = f"{src.upper()}→{dst.upper()} ({provider_name})"
         total = len(current)
         done = 0
@@ -588,8 +625,8 @@ def translate_with_chain(
                 wait_if_paused()
             if should_stop and should_stop():
                 # Сохраняем кэш и дополняем оставшиеся исходными
-                if cache is not None:
-                    cache.save()
+                if stage_cache is not None:
+                    stage_cache.save()
                 translated.extend(current[i:])
                 translated_contexts.extend(current_contexts[i:])
                 current = translated
@@ -606,8 +643,8 @@ def translate_with_chain(
                 if not t.strip():
                     cached_results[k] = ""
                     continue
-                if cache is not None:
-                    cached = cache.get(src, dst, t)
+                if stage_cache is not None:
+                    cached = stage_cache.get(src, dst, t)
                     if cached is not None:
                         cached_results[k] = cached
                         continue
@@ -630,17 +667,34 @@ def translate_with_chain(
                         attempts += 1
                         if not e.recoverable or attempts >= 3:
                             # Перед выходом сохраним то, что успели в кэш
-                            if cache is not None:
-                                cache.save()
+                            if stage_cache is not None:
+                                stage_cache.save()
                             raise
-                        time.sleep(2 ** attempts)
+                        # Пауза между попытками не должна делать приложение
+                        # глухим: спим короткими шагами и проверяем «Стоп».
+                        delay = e.retry_after or float(2 ** attempts)
+                        _interruptible_sleep(delay, should_stop)
+                        if should_stop and should_stop():
+                            if stage_cache is not None:
+                                stage_cache.save()
+                            raise
 
-                # Кладём в кэш и в результат
-                if cache is not None:
-                    pairs = list(zip(api_texts, api_results))
-                    cache.set_many(src, dst, pairs)
-                for kk, val in zip(to_translate_idx, api_results):
-                    cached_results[kk] = val
+                # Проверяем целостность плейсхолдеров ДО кэширования.
+                # Битый ответ, попавший в кэш, оставался там навсегда: при
+                # следующем запуске строка бралась из кэша, снова не проходила
+                # валидацию и уже никогда не переводилась заново.
+                good_pairs: list[tuple[str, str]] = []
+                for kk, source_text, val in zip(to_translate_idx, api_texts, api_results):
+                    if _placeholders_intact(source_text, val):
+                        cached_results[kk] = val
+                        good_pairs.append((source_text, val))
+                    else:
+                        # Пустой результат = «не переведено»: строка останется
+                        # исходной, а следующий запуск попробует её снова.
+                        cached_results[kk] = ""
+                        rejected += 1
+                if stage_cache is not None and good_pairs:
+                    stage_cache.set_many(src, dst, good_pairs)
 
             # Собираем итоговый батч в правильном порядке
             full = [cached_results.get(k, "") for k in range(len(batch))]
@@ -649,19 +703,21 @@ def translate_with_chain(
 
             done += len(batch)
             if progress_cb:
-                progress_cb(done, total, stage_label)
+                # Прогресс сквозной по всей цепочке: раньше при маршруте
+                # JP→EN→RU полоса доходила до 100 % и обнулялась.
+                progress_cb(stage_idx * total + done, total * stage_count, stage_label)
 
             # Периодическое сохранение кэша
             batches_since_save += 1
-            if cache is not None and batches_since_save >= save_cache_every:
-                cache.save()
+            if stage_cache is not None and batches_since_save >= save_cache_every:
+                stage_cache.save()
                 batches_since_save = 0
 
             i += batch_size
         else:
             # Цикл while закончился штатно (без break) — финальное сохранение
-            if cache is not None:
-                cache.save()
+            if stage_cache is not None:
+                stage_cache.save()
 
         # Если break сработал (остановка) — выходим из всех стадий
         if should_stop and should_stop():
@@ -670,6 +726,8 @@ def translate_with_chain(
         current = translated
         current_contexts = translated_contexts
 
+    if rejected and stats is not None:
+        stats["rejected_placeholders"] = rejected
     return current
 
 

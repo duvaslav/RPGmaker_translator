@@ -1,0 +1,18 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Локальные артефакты перевода
+_translation_cache.json
+_glossary.json
+*.pre_translator_autowrap.bak
+translation-repair-report.json
+
+# Редакторы
+.idea/
+.vscode/
+*.swp
+.DS_Store

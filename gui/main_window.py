@@ -6,19 +6,19 @@ from __future__ import annotations
 from pathlib import Path
 
 from PyQt6.QtCore import Qt, QSize, QTimer
-from PyQt6.QtGui import QFont, QIcon, QPalette, QColor, QAction
+from PyQt6.QtGui import QPalette, QColor
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
     QLabel, QPushButton, QLineEdit, QComboBox, QCheckBox, QSpinBox, QGroupBox,
     QFileDialog, QPlainTextEdit, QProgressBar, QTabWidget, QMessageBox,
-    QFrame, QSizePolicy, QScrollArea, QDialog, QListWidget, QListWidgetItem,
-    QDialogButtonBox, QAbstractItemView, QTextBrowser,
+    QFrame, QScrollArea, QDialog, QListWidget, QListWidgetItem,
+    QAbstractItemView, QTextBrowser,
 )
 
 from core.config import load_config, save_config
-from core.rpgmaker_parser import analyze_project, ProjectStats
+from core.rpgmaker_parser import ProjectStats
 from core.translators import TranslationRoute
-from core.worker import TranslationWorker
+from core.worker import TranslationWorker, AnalysisWorker, KeySearchWorker
 
 
 # ────────────────────────────────────────────────────────────────────────────
@@ -325,6 +325,41 @@ class MainWindow(QMainWindow):
             # Делаем через таймер, чтобы окно успело отрисоваться
             QTimer.singleShot(50, self._detect_encryption)
 
+    # ── Завершение работы ──────────────────────────────────────────────────
+
+    def closeEvent(self, event) -> None:
+        """Корректно гасим фоновые потоки при закрытии окна.
+
+        Без этого Qt уничтожал живой QThread («QThread: Destroyed while thread
+        is still running»), а если перевод стоял на паузе — приложение вообще
+        не закрывалось: поток ждал снятия паузы бесконечно.
+        """
+        worker = getattr(self, "worker", None)
+        if worker is not None and worker.isRunning():
+            reply = QMessageBox.question(
+                self, "Перевод ещё идёт",
+                "Перевод выполняется. Остановить и выйти?\n\n"
+                "Прогресс сохранён в кэше — при следующем запуске "
+                "работа продолжится с этого места.",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                event.ignore()
+                return
+            worker.request_stop()
+            worker.request_resume()      # снимаем паузу, иначе поток не выйдет
+            if not worker.wait(15000):
+                worker.terminate()
+                worker.wait(2000)
+
+        for name in ("analysis_worker", "key_worker"):
+            thread = getattr(self, name, None)
+            if thread is not None and thread.isRunning():
+                thread.wait(5000)
+
+        event.accept()
+
     # ── Вкладка «Перевод» ──────────────────────────────────────────────────
 
     def _build_translate_tab(self) -> QWidget:
@@ -462,27 +497,52 @@ class MainWindow(QMainWindow):
         og.setColumnStretch(1, 0)
         og.setColumnStretch(2, 1)  # пустая колонка-распорка
 
-        self.group_dialogues_cb = QCheckBox("Склеивать строки диалога для контекста")
+        self.fit_messages_cb = QCheckBox(
+            "Пересобирать вёрстку сообщений (рекомендуется)"
+        )
+        self.fit_messages_cb.setChecked(self.config.get("fit_messages", True))
+        self.fit_messages_cb.setToolTip(
+            "Склеивает авторские переносы перед отправкой в переводчик, чтобы он "
+            "видел целые предложения, а не обрывки строк. После перевода заново "
+            "переносит текст по реальной ширине окна и разбивает его на окна по "
+            "границам предложений.\n\n"
+            "Без этой опции каждая визуальная строка переводится отдельно — "
+            "именно из-за этого «Trigger Condition» превращается в «спусковой крючок»."
+        )
+        og.addWidget(self.fit_messages_cb, 0, 0, 1, 3)
+
+        self.auto_glossary_cb = QCheckBox(
+            "Защищать имена персонажей от перевода"
+        )
+        self.auto_glossary_cb.setChecked(self.config.get("auto_glossary", True))
+        self.auto_glossary_cb.setToolTip(
+            "Имена из Actors.json и тегов \\N<…> не отправляются в переводчик. "
+            "Без этого персонаж Airy становится «Воздушным».\n"
+            "Список правится в файле _glossary.json в выходной папке."
+        )
+        og.addWidget(self.auto_glossary_cb, 1, 0, 1, 3)
+
+        self.group_dialogues_cb = QCheckBox("Склеивать соседние реплики для контекста")
         self.group_dialogues_cb.setChecked(self.config.get("group_dialogues", True))
-        og.addWidget(self.group_dialogues_cb, 0, 0, 1, 3)
+        og.addWidget(self.group_dialogues_cb, 2, 0, 1, 3)
 
         self.text_wrap_cb = QCheckBox(
-            "Автоперенос по реальной ширине окна (MV/MZ)"
+            "Ставить в игру страховочный модуль переноса (MV/MZ)"
         )
         self.text_wrap_cb.setChecked(self.config.get("install_text_wrap", True))
         self.text_wrap_cb.setToolTip(
-            "Устанавливает в игру совместимый модуль. Он измеряет текст активным "
-            "игровым шрифтом и автоматически переносит/разбивает длинные сообщения на страницы."
+            "Подстраховка на случай, если игрок сменит шрифт или другой плагин "
+            "изменит ширину окна: модуль домеряет строки уже внутри игры."
         )
-        og.addWidget(self.text_wrap_cb, 1, 0, 1, 3)
+        og.addWidget(self.text_wrap_cb, 3, 0, 1, 3)
 
-        og.addWidget(QLabel("Размер пакета:"), 2, 0)
+        og.addWidget(QLabel("Размер пакета:"), 4, 0)
         self.batch_spin = QSpinBox()
         self.batch_spin.setRange(1, 200)
         self.batch_spin.setValue(self.config.get("batch_size", 40))
         self.batch_spin.setMinimumWidth(80)
         self.batch_spin.setMaximumWidth(120)
-        og.addWidget(self.batch_spin, 2, 1)
+        og.addWidget(self.batch_spin, 4, 1)
 
         opt_hint = QLabel(
             "Меньший пакет = больше запросов, но стабильнее. Для DeepL подходит 40–50, "
@@ -490,7 +550,7 @@ class MainWindow(QMainWindow):
         )
         opt_hint.setObjectName("hint")
         opt_hint.setWordWrap(True)
-        og.addWidget(opt_hint, 3, 0, 1, 3)
+        og.addWidget(opt_hint, 5, 0, 1, 3)
 
         lay.addWidget(opt_box)
 
@@ -737,7 +797,7 @@ class MainWindow(QMainWindow):
             return
 
         try:
-            from core.crypto import is_data_dir_encrypted, auto_find_key
+            from core.crypto import is_data_dir_encrypted
         except ImportError as e:
             self.crypto_status.setText(
                 f"⚠ Не загружен модуль шифрования: {e}. "
@@ -769,20 +829,23 @@ class MainWindow(QMainWindow):
                 )
                 return
 
-        # Пытаемся найти автоматически
+        # Поиск ключа — в фоне: перебор кандидатов с расшифровкой AES
+        # раньше намертво вешал окно на десятки секунд.
         self.crypto_status.setText("🔒 Файлы зашифрованы. Ищу ключ…")
-        QApplication.processEvents()
+        self.key_worker = KeySearchWorker(d, parent=self)
+        self.key_worker.done.connect(self._on_key_found)
+        self.key_worker.start()
 
-        key, managers_path = auto_find_key(Path(d))
+    def _on_key_found(self, key, managers_path) -> None:
+        where = Path(managers_path).name if managers_path else "js/rmmz_managers.js"
         if key:
             self.crypto_key_edit.setText(key)
             self.crypto_status.setText(
                 f"🔒 Файлы зашифрованы CryptoJS AES. ✓ Ключ найден автоматически "
-                f"в <code>{managers_path.name}</code>."
+                f"в <code>{where}</code>."
             )
             self._log("success", f"Ключ шифрования найден: {key[:4]}…")
         else:
-            where = managers_path.name if managers_path else "js/rmmz_managers.js"
             self.crypto_status.setText(
                 "🔒 Файлы зашифрованы CryptoJS AES, но <b>ключ найти не удалось</b>.<br>"
                 f"Проверь сам: открой <code>{where}</code> рядом с папкой data, "
@@ -800,7 +863,7 @@ class MainWindow(QMainWindow):
             )
             return
         try:
-            from core.crypto import find_managers_js, auto_find_key
+            from core.crypto import auto_find_key
         except ImportError as e:
             QMessageBox.critical(
                 self, "Шифрование",
@@ -850,14 +913,14 @@ class MainWindow(QMainWindow):
         direct = find_key_in_managers_js(text)
         if direct and _key_works(direct, Path(d)):
             self.crypto_key_edit.setText(direct)
-            self.crypto_status.setText(f"🔒 ✓ Ключ найден в выбранном файле.")
+            self.crypto_status.setText("🔒 ✓ Ключ найден в выбранном файле.")
             return
 
         # Кандидаты с проверкой
         for c in _collect_key_candidates(text):
             if _key_works(c, Path(d)):
                 self.crypto_key_edit.setText(c)
-                self.crypto_status.setText(f"🔒 ✓ Ключ найден в выбранном файле.")
+                self.crypto_status.setText("🔒 ✓ Ключ найден в выбранном файле.")
                 return
 
         QMessageBox.warning(
@@ -910,13 +973,24 @@ class MainWindow(QMainWindow):
             self.dst_edit.setText(d)
 
     def _save_keys(self) -> None:
-        self.config["api_keys"]["DeepL"] = self.deepl_key.text().strip()
-        self.config["api_keys"]["Yandex"] = self.yandex_key.text().strip()
-        self.config["yandex_folder_id"] = self.yandex_folder.text().strip()
+        self._sync_keys_from_fields()
         save_config(self.config)
         self._log("success", "Ключи сохранены")
 
-    def _collect_route_and_providers(self) -> tuple[TranslationRoute, list[tuple]] | None:
+    def _sync_keys_from_fields(self) -> None:
+        """Переносит содержимое полей ключей в конфиг.
+
+        Раньше ключ применялся только после нажатия «Сохранить ключи»: человек
+        вставлял ключ, сразу жал «Запустить перевод» и получал «Для DeepL нужен
+        API-ключ». Теперь поля — источник истины.
+        """
+        self.config["api_keys"]["DeepL"] = self.deepl_key.text().strip()
+        self.config["api_keys"]["Yandex"] = self.yandex_key.text().strip()
+        self.config["yandex_folder_id"] = self.yandex_folder.text().strip()
+
+    def _collect_route_and_providers(self, require_keys: bool = True
+                                     ) -> tuple[TranslationRoute, list[tuple]] | None:
+        self._sync_keys_from_fields()
         src = self.src_lang.currentData()
         pivot = self.pivot_lang.currentData() or None
         dst = self.dst_lang.currentData()
@@ -936,6 +1010,8 @@ class MainWindow(QMainWindow):
             api_key = keys.get(pname, "")
             extra: dict = {}
             if pname in ("DeepL", "Yandex") and not api_key:
+                if not require_keys:
+                    return None      # анализу ключи не нужны, молча выходим
                 QMessageBox.warning(
                     self, "API-ключ",
                     f"Для {pname} нужен API-ключ. Перейди на вкладку «API-ключи».",
@@ -944,6 +1020,8 @@ class MainWindow(QMainWindow):
             if pname == "Yandex":
                 folder_id = self.config.get("yandex_folder_id", "").strip()
                 if not folder_id:
+                    if not require_keys:
+                        return None
                     QMessageBox.warning(
                         self, "Yandex",
                         "Для Yandex нужен Folder ID. Перейди на вкладку «API-ключи» "
@@ -1044,6 +1122,29 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Путь", "Укажи выходную папку.")
             return
 
+        # Выходная папка удаляется целиком перед копированием проекта, поэтому
+        # опасные варианты (выбрали www, выбрали Рабочий стол) отсекаем ЗДЕСЬ,
+        # пока ничего не удалено.
+        from core.safety import check_output_dir, UnsafeOutputDir
+        probe_out = dst_dir
+        if test_files:
+            probe_out = str(Path(dst_dir).with_name(Path(dst_dir).name + "_TEST"))
+        try:
+            check_output_dir(src_dir, probe_out)
+        except UnsafeOutputDir as exc:
+            QMessageBox.critical(self, "Опасная выходная папка", str(exc))
+            return
+        if Path(probe_out).exists() and not (Path(probe_out) / "_translation_cache.json").exists():
+            reply = QMessageBox.question(
+                self, "Папка будет очищена",
+                f"Папка уже существует и будет УДАЛЕНА целиком перед копированием:\n\n"
+                f"{probe_out}\n\nПродолжить?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                return
+
         rp = self._collect_route_and_providers()
         if not rp:
             return
@@ -1058,6 +1159,8 @@ class MainWindow(QMainWindow):
         self.config["batch_size"] = self.batch_spin.value()
         self.config["group_dialogues"] = self.group_dialogues_cb.isChecked()
         self.config["install_text_wrap"] = self.text_wrap_cb.isChecked()
+        self.config["fit_messages"] = self.fit_messages_cb.isChecked()
+        self.config["auto_glossary"] = self.auto_glossary_cb.isChecked()
         lang_filter = self._get_language_filter()
         self.config["lang_filter"] = lang_filter or []
         encryption_key = self.crypto_key_edit.text().strip()
@@ -1099,6 +1202,8 @@ class MainWindow(QMainWindow):
             lang_filter=lang_filter,
             encryption_key=encryption_key or None,
             install_text_wrap=self.text_wrap_cb.isChecked(),
+            fit_messages=self.fit_messages_cb.isChecked(),
+            auto_glossary=self.auto_glossary_cb.isChecked(),
         )
         self.worker.log.connect(self._log)
         self.worker.progress.connect(self._on_progress)
@@ -1138,7 +1243,7 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Путь", "Укажи папку Data игры — её нужно проанализировать.")
             return
 
-        rp = self._collect_route_and_providers()
+        rp = self._collect_route_and_providers(require_keys=False)
         if rp is None:
             # Анализ может быть без валидных ключей — нам важен только маршрут
             src_l = self.src_lang.currentData() or "?"
@@ -1164,33 +1269,54 @@ class MainWindow(QMainWindow):
         )
         i18n_field = _RP.I18N_FIELD_BY_LANG.get(src_lang_for_i18n)
 
-        # Запуск анализа — синхронно, обычно быстро (секунды)
-        self.analyze_btn.setEnabled(False)
-        self.analyze_btn.setText("Анализ…")
-        QApplication.processEvents()
-        try:
-            crypto = self._make_crypto_or_warn()
-            if crypto is False:  # ключ задан, но невалидный
-                return
-            stats, _ = analyze_project(
-                src_dir,
-                group_dialogues=self.group_dialogues_cb.isChecked(),
-                crypto=crypto,
-                i18n_field=i18n_field,
-            )
-        except Exception as e:
-            QMessageBox.critical(self, "Ошибка анализа", str(e))
-            self.analyze_btn.setEnabled(True)
-            self.analyze_btn.setText("Анализ объёма")
+        # Анализ в фоновом потоке: на большой игре он занимает десятки
+        # секунд, и раньше всё это время окно не отвечало.
+        crypto = self._make_crypto_or_warn()
+        if crypto is False:      # ключ задан, но невалидный
             return
-        finally:
-            self.analyze_btn.setEnabled(True)
-            self.analyze_btn.setText("Анализ объёма")
 
-        self._last_stats = stats  # сохраняем для использования в тесте
+        self.analyze_btn.setEnabled(False)
+        self.test_btn.setEnabled(False)
+        self.start_btn.setEnabled(False)
+        self.analyze_btn.setText("Анализ…")
+        self.phase_label.setText("Анализ проекта…")
+
+        self._pending_analysis = (route_label, num_stages)
+        self.analysis_worker = AnalysisWorker(
+            src_dir,
+            self.group_dialogues_cb.isChecked(),
+            crypto,
+            i18n_field,
+            parent=self,
+        )
+        self.analysis_worker.done.connect(self._on_analysis_done)
+        self.analysis_worker.failed.connect(self._on_analysis_failed)
+        self.analysis_worker.phase.connect(self.phase_label.setText)
+        self.analysis_worker.start()
+
+    def _reset_analysis_buttons(self) -> None:
+        self.analyze_btn.setEnabled(True)
+        self.test_btn.setEnabled(True)
+        self.start_btn.setEnabled(True)
+        self.analyze_btn.setText("Анализ объёма")
+        self.phase_label.setText("Готов к запуску")
+
+    def _on_analysis_done(self, stats: ProjectStats) -> None:
+        self._reset_analysis_buttons()
+        self._last_stats = stats
         self._refresh_language_checks(stats)
+        route_label, num_stages = getattr(self, "_pending_analysis", ("", 1))
+        if getattr(self, "_analysis_then_test", False):
+            self._analysis_then_test = False
+            self._open_file_selection()
+            return
         dlg = AnalysisDialog(stats, route_label, num_stages, parent=self)
         dlg.exec()
+
+    def _on_analysis_failed(self, message: str) -> None:
+        self._reset_analysis_buttons()
+        self._analysis_then_test = False
+        QMessageBox.critical(self, "Ошибка анализа", message)
 
     def _refresh_language_checks(self, stats: ProjectStats) -> None:
         """Заполняет секцию языкового фильтра чекбоксами на основе анализа."""
@@ -1242,37 +1368,17 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Путь", "Сначала укажи папку Data игры.")
             return
 
-        # Сначала анализ (если ещё не делали), затем диалог выбора файлов
-        if not hasattr(self, "_last_stats") or self._last_stats is None:
-            self.analyze_btn.setEnabled(False)
-            self.test_btn.setEnabled(False)
-            self.test_btn.setText("Анализ…")
-            QApplication.processEvents()
-            try:
-                crypto = self._make_crypto_or_warn()
-                if crypto is False:
-                    return
-                from core.rpgmaker_parser import RPGMakerProject as _RP
-                _src_lang = self.src_lang.currentData() or ""
-                _i18n_field = _RP.I18N_FIELD_BY_LANG.get(_src_lang)
-                stats, _ = analyze_project(
-                    src_dir,
-                    group_dialogues=self.group_dialogues_cb.isChecked(),
-                    crypto=crypto,
-                    i18n_field=_i18n_field,
-                )
-                self._last_stats = stats
-                self._refresh_language_checks(stats)
-            except Exception as e:
-                QMessageBox.critical(self, "Ошибка анализа", str(e))
-                return
-            finally:
-                self.analyze_btn.setEnabled(True)
-                self.test_btn.setEnabled(True)
-                self.test_btn.setText("Тестовый прогон")
+        # Анализ нужен, чтобы показать список файлов. Он идёт в фоне, а диалог
+        # выбора откроется в _on_analysis_done.
+        if getattr(self, "_last_stats", None) is None:
+            self._analysis_then_test = True
+            self._analyze()
+            return
+        self._open_file_selection()
 
+    def _open_file_selection(self) -> None:
         stats = self._last_stats
-        if not stats.by_file:
+        if stats is None or not stats.by_file:
             QMessageBox.information(
                 self, "Нет файлов",
                 "В проекте не найдено файлов с переводимым текстом."
@@ -1404,7 +1510,7 @@ class AnalysisDialog(QDialog):
             (f"Маршрут: {route_label}", ""),
         ]
         chars_estimate = stats.estimate_chars_per_stage(stages=num_stages)
-        rows2.append((f"Расход за весь перевод (≈):", f"{chars_estimate:,}"))
+        rows2.append(("Расход за весь перевод (≈):", f"{chars_estimate:,}"))
 
         # Доля от Free
         pct_of_free = chars_estimate / DEEPL_FREE_LIMIT * 100
@@ -1418,7 +1524,7 @@ class AnalysisDialog(QDialog):
         else:
             color = "#A6D49F"
         rows2.append(
-            (f"От DeepL Free (500 000/мес):",
+            ("От DeepL Free (500 000/мес):",
              f"{pct_of_free:.1f}%{warning}")
         )
 
@@ -1699,7 +1805,7 @@ class PreviewDialog(QDialog):
             if item.original:
                 parts.append(
                     f'<div style="color:{C_LABEL};font-size:11px">ОРИГИНАЛ:</div>'
-                    f'<div style="color:#9A9382;margin-bottom:8px">'
+                    f'<div style="color:{C_ORIG};margin-bottom:8px">'
                     f'{highlight_codes(item.original)}</div>'
                 )
             parts.append(

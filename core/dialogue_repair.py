@@ -256,8 +256,9 @@ def repair_game(game_dir: Path, install: bool = False) -> dict[str, Any]:
     extra: dict[str, Any] = {}
     if provider == "Yandex":
         extra["folder_id"] = config.get("yandex_folder_id", "")
-    elif provider == "DeepL":
-        extra["free_tier"] = config.get("deepl_free_tier")
+    # free_tier НЕ передаём: DeepLTranslator сам определит endpoint по суффиксу
+    # ключа («:fx» = Free). Жёсткое значение из конфига отправляло Pro-ключ на
+    # free-endpoint и ловило 403.
 
     project = RPGMakerProject(staging)
     source_project = RPGMakerProject(source)

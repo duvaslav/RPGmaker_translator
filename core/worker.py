@@ -11,6 +11,7 @@ from pathlib import Path
 
 from PyQt6.QtCore import QThread, pyqtSignal
 
+from core.safety import UnsafeOutputDir, check_output_dir
 from core.rpgmaker_parser import (
     RPGMakerProject, build_translation_units, split_translated_unit,
 )
@@ -40,6 +41,8 @@ class TranslationWorker(QThread):
         lang_filter: list[str] | None = None,
         encryption_key: str | None = None,
         install_text_wrap: bool = True,
+        auto_glossary: bool = True,
+        fit_messages: bool = True,
         parent=None,
     ):
         super().__init__(parent)
@@ -56,6 +59,10 @@ class TranslationWorker(QThread):
         # Если задан — файлы зашифрованы CryptoJS AES с этим ключом
         self.encryption_key = encryption_key.strip() if encryption_key else None
         self.install_text_wrap = install_text_wrap
+        # Автоматически пополнять глоссарий именами из Actors.json
+        self.auto_glossary = auto_glossary
+        # Пересобирать вёрстку сообщений (расклейка + перенос по ширине окна)
+        self.fit_messages = fit_messages
 
         self._stop = False
         # Event для паузы: set() = идём, clear() = ждём
@@ -96,7 +103,12 @@ class TranslationWorker(QThread):
         if not self._pause_event.is_set():
             self.phase.emit("⏸ Пауза — ожидание возобновления…")
             self.log.emit("warn", "Перевод приостановлен")
-            self._pause_event.wait()
+            # С таймаутом, а не навсегда: закрытие окна во время паузы раньше
+            # оставляло поток висеть, и приложение не завершалось.
+            while not self._pause_event.wait(timeout=0.2):
+                if self._stop:
+                    self._pause_event.set()
+                    break
             if not self._stop:
                 self.log.emit("info", "Возобновление перевода")
                 self.phase.emit("Перевод…")
@@ -134,11 +146,15 @@ class TranslationWorker(QThread):
             self.log.emit("info", f"Источник: {self.project_dir}")
             self.log.emit("info", f"Цель: {self.output_dir}")
 
+            try:
+                check_output_dir(self.project_dir, self.output_dir)
+            except UnsafeOutputDir as exc:
+                raise TranslationError(str(exc))
             if self.output_dir.exists():
-                if self.output_dir.resolve() == self.project_dir.resolve():
-                    raise TranslationError(
-                        "Выходная папка не может совпадать с исходной"
-                    )
+                self.log.emit(
+                    "warn",
+                    f"Выходная папка существует и будет перезаписана: {self.output_dir}",
+                )
                 shutil.rmtree(self.output_dir)
             shutil.copytree(self.project_dir, self.output_dir)
             self.log.emit("success", "Копия проекта создана")
@@ -181,13 +197,38 @@ class TranslationWorker(QThread):
                 f"{i18n_field} (замещение языка-источника).",
             )
 
+        # Глоссарий: имена персонажей не должны переводиться как обычные слова.
+        # Без него DeepL/Yandex превращают персонажа Airy в «Воздушного».
+        from core.glossary import Glossary, build_auto_glossary, GLOSSARY_FILENAME
+        glossary_path = self.output_dir / GLOSSARY_FILENAME
+        glossary = Glossary.load(glossary_path)
+        before = len(glossary)
+        if self.auto_glossary:
+            glossary = build_auto_glossary(self.project_dir, glossary)
+        if len(glossary) != before or not glossary_path.exists():
+            try:
+                glossary.save(glossary_path)
+            except OSError as exc:
+                self.log.emit("warn", f"Не удалось сохранить глоссарий: {exc}")
+        if glossary:
+            self.log.emit(
+                "info",
+                f"📖 Глоссарий: {len(glossary)} терминов не пойдут в переводчик "
+                f"(правится в {glossary_path.name})",
+            )
+
         # 2. Парсинг (всегда заново — на случай если файлы изменились)
         self.phase.emit("Извлечение текста…")
-        project = RPGMakerProject(self.output_dir, crypto=crypto, i18n_field=i18n_field)
+        project = RPGMakerProject(self.output_dir, crypto=crypto, i18n_field=i18n_field,
+                                  glossary=glossary, fit_messages=self.fit_messages)
         # ВАЖНО: парсим ИСХОДНУЮ папку, потому что output может уже содержать
         # частично переведённый текст. Для resume используем source.
         if is_resume:
-            source_project = RPGMakerProject(self.project_dir, crypto=crypto, i18n_field=i18n_field)
+            source_project = RPGMakerProject(
+                self.project_dir, crypto=crypto, i18n_field=i18n_field,
+                glossary=glossary, layout=project.layout,
+                fit_messages=self.fit_messages,
+            )
             source_project.extract_all()
             # Копируем entries, но привязываем к выходным файлам
             project.entries = source_project.entries
@@ -266,6 +307,7 @@ class TranslationWorker(QThread):
         # Главный вызов. Любой выход (успех/ошибка/stop) — сохраняем то, что есть.
         translated_texts: list[str] = []
         translation_error: Exception | None = None
+        chain_stats: dict = {}
         try:
             translated_texts = translate_with_chain(
                 unit_texts,
@@ -276,6 +318,7 @@ class TranslationWorker(QThread):
                 should_stop=self._should_stop,
                 wait_if_paused=self._wait_if_paused,
                 cache=cache,
+                stats=chain_stats,
             )
         except TranslationError as e:
             translation_error = e
@@ -287,21 +330,52 @@ class TranslationWorker(QThread):
             self.log.emit("error", f"Непредвиденная ошибка: {e}")
             translated_texts = self._recover_from_cache(unit_texts, cache, self.route.stages())
 
+        if chain_stats.get("rejected_placeholders"):
+            self.log.emit(
+                "warn",
+                f"⚠ Провайдер повредил управляющие коды в "
+                f"{chain_stats['rejected_placeholders']} строках. В кэш они НЕ "
+                "попали — повторный запуск переведёт их заново.",
+            )
+
         # 5. Применяем то, что у нас есть, к JSON-файлам. Делается даже при ошибке —
         # чтобы частичный перевод сохранился и можно было продолжить с того же места.
         self.phase.emit("Сборка переводов…")
         translations: dict[int, str] = {}
+        damaged = 0
         for unit, translated in zip(units, translated_texts):
             # Не записываем «пустые» переводы поверх исходного текста.
             # Пустой = unit не успел перевестись (stop/ошибка), оставляем исходник.
             if not translated.strip() and unit.combined_text.strip():
                 continue
-            translations.update(split_translated_unit(unit, translated))
+            try:
+                translations.update(split_translated_unit(unit, translated))
+            except ValueError:
+                # Провайдер испортил границы этой единицы. Раньше исключение
+                # улетало наружу и обрывало ВСЮ запись: пользователь получал
+                # трейсбек и ни одного записанного файла. Теперь теряется
+                # только эта строка — она останется на языке источника.
+                damaged += 1
+        if damaged:
+            self.log.emit(
+                "warn",
+                f"⚠ Переводчик повредил границы в {damaged} пакет(ах) — "
+                "эти строки оставлены на языке источника, остальные записаны.",
+            )
 
         if translations:
             self.phase.emit("Запись файлов…")
             val_stats = project.apply_translations(translations)
             self.log.emit("success", f"Записано переводов: {len(translations)}")
+            if val_stats.get("rewrapped"):
+                extra = val_stats.get("extra_windows", 0)
+                width = project.layout.available_width() if project.layout else 0
+                tail = (f", добавлено окон: {extra}" if extra else "")
+                self.log.emit(
+                    "success",
+                    f"✓ Пересобрана вёрстка {val_stats['rewrapped']} сообщений "
+                    f"по ширине {width} px{tail}",
+                )
             # Отчёт о целостности управляющих кодов
             if val_stats["with_codes"] > 0:
                 broken = val_stats["broken"]
@@ -397,3 +471,64 @@ class TranslationWorker(QThread):
                 current = cached
             result.append(current)
         return result
+
+
+class AnalysisWorker(QThread):
+    """Анализ проекта в фоне.
+
+    Раньше `analyze_project` вызывался прямо из обработчика кнопки с пометкой
+    «обычно быстро (секунды)». На реальной игре разбор карт, сканирование JS и
+    определение языков занимают десятки секунд, и всё это время окно висело
+    без реакции — Windows успевала подписать его «Не отвечает».
+    """
+
+    done = pyqtSignal(object)     # ProjectStats
+    failed = pyqtSignal(str)
+    phase = pyqtSignal(str)
+
+    def __init__(self, data_dir: str, group_dialogues: bool, crypto,
+                 i18n_field: str | None, glossary=None, parent=None):
+        super().__init__(parent)
+        self.data_dir = data_dir
+        self.group_dialogues = group_dialogues
+        self.crypto = crypto
+        self.i18n_field = i18n_field
+        self.glossary = glossary
+
+    def run(self) -> None:
+        try:
+            from core.rpgmaker_parser import analyze_project
+            self.phase.emit("Анализ проекта…")
+            stats, _ = analyze_project(
+                self.data_dir,
+                group_dialogues=self.group_dialogues,
+                crypto=self.crypto,
+                i18n_field=self.i18n_field,
+                glossary=self.glossary,
+            )
+            self.done.emit(stats)
+        except Exception as exc:      # noqa: BLE001 — показываем пользователю
+            self.failed.emit(str(exc))
+
+
+class KeySearchWorker(QThread):
+    """Подбор ключа шифрования в фоне.
+
+    Перебор строковых литералов обфусцированного rmmz_managers.js с проверкой
+    каждого кандидата через AES — это тысячи расшифровок. В GUI-потоке они
+    полностью замораживали окно.
+    """
+
+    done = pyqtSignal(object, object)   # (key | None, managers_path | None)
+
+    def __init__(self, data_dir: str, parent=None):
+        super().__init__(parent)
+        self.data_dir = data_dir
+
+    def run(self) -> None:
+        try:
+            from core.crypto import auto_find_key
+            key, managers = auto_find_key(Path(self.data_dir))
+        except Exception:
+            key, managers = None, None
+        self.done.emit(key, managers)

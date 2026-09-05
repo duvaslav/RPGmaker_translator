@@ -12,25 +12,29 @@
 """
 from __future__ import annotations
 
+import html as _html
 import json
+import os
 import re
-from dataclasses import dataclass, field
+import tempfile
+from dataclasses import dataclass
 from pathlib import Path
 from collections import Counter
-from typing import Any, Iterator
+from typing import Any
+
+from core.text_fit import fit_message, flatten_for_translation
 
 
 # Коды команд событий, содержащих текст
 EVENT_TEXT_CODES = {
-    101: "name_speaker",   # Show Text — header (имя говорящего в параметре 4 для MZ)
-    401: "text_line",      # Show Text — строка диалога
-    102: "choices",        # Show Choices — массив вариантов
-    402: "choice_when",    # When [choice] — параметр 1 это текст
-    405: "scroll_text",    # Scrolling Text — строка
-    324: "name_input",     # Name Input — обычно не текст, но имя актёра
-    320: "change_name",    # Change Name — новое имя актёра
-    324: "name_input_processing",
-    355: "script",         # Script — не трогаем
+    101: "message_header",  # Show Text — header (имя говорящего в params[4] у MZ)
+    401: "text_line",       # Show Text — строка сообщения
+    102: "choices",         # Show Choices — массив вариантов
+    402: "choice_when",     # When [choice] — параметр 1 это текст
+    405: "scroll_text",     # Scrolling Text — строка
+    320: "change_name",     # Change Name — новое имя актёра
+    324: "name_input",      # Name Input Processing
+    355: "script",          # Script — не трогаем
 }
 
 SCRIPT_LIKE_EVENT_CODES = {
@@ -154,10 +158,16 @@ _PLACEHOLDER_RESTORE = re.compile(
 )
 
 
-def protect_codes(text: str) -> tuple[str, list[str]]:
+def protect_codes(text: str, glossary=None) -> tuple[str, list[str]]:
     """Заменяет управляющие коды на HTML-теги-плейсхолдеры.
 
     Возвращает (текст_с_плейсхолдерами, список_кодов).
+
+    Если передан `glossary`, его термины (имена персонажей и т.п.) тоже
+    заменяются плейсхолдерами и в переводчик не попадают. В список codes
+    кладётся уже целевая форма термина, поэтому restore_codes вернёт в текст
+    «Айри», а не «Airy». Без этого DeepL/Yandex переводят имена как обычные
+    слова — в реальном прогоне «Airy» стал «Воздушным».
 
     Важно для html-режима переводчиков: «голые» спецсимволы < > & в тексте
     (например «цена < 100», «A & B») экранируются в &lt; &gt; &amp;, чтобы
@@ -176,9 +186,9 @@ def protect_codes(text: str) -> tuple[str, list[str]]:
     last_end = 0
 
     for m in CONTROL_CODE_PATTERN.finditer(text):
-        # Текст до кода — экранируем
+        # Текст до кода: в нём ещё могут быть термины глоссария
         plain_segment = text[last_end:m.start()]
-        result_parts.append(_escape_for_html(plain_segment))
+        _emit_plain(plain_segment, glossary, codes, result_parts)
         # Сам код → плейсхолдер
         idx = len(codes)
         codes.append(m.group(0))
@@ -186,9 +196,28 @@ def protect_codes(text: str) -> tuple[str, list[str]]:
         last_end = m.end()
 
     # Хвост после последнего кода
-    result_parts.append(_escape_for_html(text[last_end:]))
+    _emit_plain(text[last_end:], glossary, codes, result_parts)
 
     return "".join(result_parts), codes
+
+
+def _emit_plain(segment: str, glossary, codes: list[str],
+                out: list[str]) -> None:
+    """Экранирует обычный текст, попутно пряча термины глоссария."""
+    if not segment:
+        return
+    pattern = glossary.pattern() if glossary else None
+    if pattern is None:
+        out.append(_escape_for_html(segment))
+        return
+    pos = 0
+    for m in pattern.finditer(segment):
+        out.append(_escape_for_html(segment[pos:m.start()]))
+        idx = len(codes)
+        codes.append(glossary.replacement(m.group(0)))
+        out.append(make_placeholder(idx))
+        pos = m.end()
+    out.append(_escape_for_html(segment[pos:]))
 
 
 def _escape_for_html(text: str) -> str:
@@ -203,10 +232,20 @@ def _escape_for_html(text: str) -> str:
 
 
 def _unescape_html_entities(text: str) -> str:
-    """Расэкранирует < > & обратно из html-сущностей. Идемпотентна."""
+    """Расэкранирует html-сущности РОВНО ОДИН РАЗ за весь конвейер.
+
+    Раньше расэкранирование шло дважды — в translators._unescape_html и здесь.
+    Из-за этого строка, где в игре реально лежит «&amp;», превращалась в «&»:
+    «Bread &amp; Butter» → «Bread & Butter». Теперь единственная точка — эта,
+    и она вызывается один раз на строку, уже после подстановки sentinel-ов,
+    поэтому сами коды не страдают.
+
+    html.unescape (а не три replace) нужен потому, что провайдеры в html-режиме
+    добавляют и свои сущности: &quot;, &#39;, &nbsp;.
+    """
     if not text or "&" not in text:
         return text
-    return (text.replace("&lt;", "<").replace("&gt;", ">").replace("&amp;", "&"))
+    return _html.unescape(text)
 
 
 def restore_codes(text: str, codes: list[str]) -> str:
@@ -266,11 +305,7 @@ def clean_for_detection(text: str) -> str:
     html-режима переводчика, а в них есть латинские буквы (lt, gt, amp),
     которые исказили бы определение языка."""
     no_ph = _PLACEHOLDER_RESTORE.sub('', text)
-    if "&" in no_ph:
-        no_ph = (no_ph.replace("&lt;", "<")
-                      .replace("&gt;", ">")
-                      .replace("&amp;", "&"))
-    return no_ph
+    return _unescape_html_entities(no_ph)
 
 
 def count_placeholders(text: str) -> set[int]:
@@ -292,6 +327,31 @@ def validate_placeholders(translated: str, expected_count: int) -> tuple[bool, s
     duplicated = any(counts[idx] != 1 for idx in expected if idx in counts)
     unexpected = any(idx not in expected for idx in found)
     return (len(missing) == 0 and not duplicated and not unexpected), missing
+
+
+_JS_STRING = re.compile(
+    r"'((?:[^'\\\n\r]|\\.){0,200})'"
+    r'|"((?:[^"\\\n\r]|\\.){0,200})"'
+    r'|`((?:[^`\\\n\r]|\\.){0,200})`'
+)
+
+
+def _string_literals(text: str) -> set[str]:
+    """Содержимое строковых литералов JS/скриптов события.
+
+    Только литералы: имя из базы данных ломает игру ровно тогда, когда его
+    сравнивают со строкой в коде. Упоминание того же слова в комментарии или
+    в описании плагина ничего не ломает и блокировать перевод не должно.
+    """
+    found: set[str] = set()
+    if not text or ("'" not in text and '"' not in text and "`" not in text):
+        return found
+    for m in _JS_STRING.finditer(text):
+        value = m.group(1) or m.group(2) or m.group(3) or ""
+        value = value.strip()
+        if value:
+            found.add(value)
+    return found
 
 
 def is_probably_technical_text(raw_text: str) -> bool:
@@ -342,6 +402,21 @@ def is_probably_technical_text(raw_text: str) -> bool:
 # ────────────────────────────────────────────────────────────────────────────
 
 @dataclass
+class MessageBlock:
+    """Одно окно сообщения: команда-заголовок 101 и её строки 401.
+
+    Хранится диапазон индексов в списке команд события, чтобы после перевода
+    можно было ПЕРЕСОБРАТЬ блок: заново перенести текст по ширине окна и, если
+    строк стало больше четырёх, разложить их на несколько окон.
+    """
+    header_index: int | None        # индекс команды 101, если она есть
+    first: int                      # индекс первой команды 401
+    last: int                       # индекс последней команды 401 (включительно)
+    indent: int = 0
+    has_face: bool = False          # у окна есть портрет → текста влезает меньше
+
+
+@dataclass
 class TextEntry:
     """Одна единица перевода с обратной ссылкой на местоположение в JSON."""
     text: str                       # исходный текст (с защищёнными кодами)
@@ -351,6 +426,12 @@ class TextEntry:
     group_id: str = ""              # ID группы (для склейки многострочных диалогов)
     is_dialogue: bool = False       # это часть диалога (для контекстной склейки)
     needs_translation: bool = True  # False = техническая строка, пропускаем переводчик
+    block: MessageBlock | None = None   # для сообщений: путь ведёт к списку команд
+
+    @property
+    def is_message(self) -> bool:
+        """True — запись описывает целое окно сообщения, а не одно значение."""
+        return self.block is not None
 
 
 # ────────────────────────────────────────────────────────────────────────────
@@ -387,7 +468,8 @@ class RPGMakerProject:
         "it": "it_IT",
     }
 
-    def __init__(self, data_dir: Path, crypto=None, i18n_field: str | None = None):
+    def __init__(self, data_dir: Path, crypto=None, i18n_field: str | None = None,
+                 glossary=None, layout=None, fit_messages: bool = True):
         self.data_dir = Path(data_dir)
         if not self.data_dir.exists():
             raise FileNotFoundError(f"Папка не найдена: {data_dir}")
@@ -395,7 +477,17 @@ class RPGMakerProject:
         self._files_cache: dict[str, Any] = {}
         self.crypto = crypto  # GameCrypto | None
         self.i18n_field = i18n_field   # имя поля в I18NTexts.json, или None
-        self._script_reference_text: str | None = None
+        self.glossary = glossary       # core.glossary.Glossary | None
+        self._script_reference_tokens: set[str] | None = None
+
+        # Вёрстка сообщений: расклейка перед переводом и перенос после него.
+        self.fit_messages = fit_messages
+        self.layout = layout
+        self.measurer = None
+        if fit_messages:
+            from core.text_fit import MessageLayout, TextMeasurer, EscapeResolver
+            self.layout = layout or MessageLayout.detect(self.data_dir)
+            self.measurer = TextMeasurer(self.layout, EscapeResolver(self.data_dir))
 
     # ── Низкоуровневое чтение/запись ────────────────────────────────────────
 
@@ -418,17 +510,33 @@ class RPGMakerProject:
         return data
 
     def _write(self, name: str, data: Any) -> None:
+        """Атомарная запись: сначала во временный файл, потом os.replace.
+
+        Обрыв процесса на середине обычного write оставлял бы игроку битый
+        MapXXX.json, который движок не откроет вообще. Кэш и установщик
+        плагина давно пишутся так же — теперь и данные игры.
+        """
         path = self.data_dir / name
         # Сериализуем в JSON-строку. ensure_ascii=False сохранит юникод.
         json_text = json.dumps(data, ensure_ascii=False)
         if self.crypto is not None:
             # Зашифровываем обратно — игра должна суметь прочитать
-            ciphertext = self.crypto.encrypt(json_text)
-            with open(path, "w", encoding="utf-8") as f:
-                f.write(ciphertext)
-        else:
-            with open(path, "w", encoding="utf-8") as f:
+            json_text = self.crypto.encrypt(json_text)
+
+        fd, tmp_name = tempfile.mkstemp(prefix=path.name + ".", suffix=".tmp",
+                                        dir=path.parent)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8", newline="") as f:
                 f.write(json_text)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp_name, path)
+        except Exception:
+            try:
+                os.unlink(tmp_name)
+            except OSError:
+                pass
+            raise
 
     # ── Извлечение текста ──────────────────────────────────────────────────
 
@@ -471,10 +579,17 @@ class RPGMakerProject:
 
     def _add(self, raw_text: str, file: str, path: tuple,
              group_id: str = "", is_dialogue: bool = False,
-             force_technical: bool = False) -> None:
+             force_technical: bool = False,
+             block: "MessageBlock | None" = None) -> None:
         if not isinstance(raw_text, str) or not raw_text.strip():
             return
-        protected, codes = protect_codes(raw_text)
+        if block is not None and self.measurer is not None:
+            # Расклеиваем авторские переносы: переводчику уходит связный текст,
+            # а не обрывки строк, подогнанные под ширину окна.
+            raw_text = flatten_for_translation(
+                raw_text, self.measurer, has_face=block.has_face,
+            )
+        protected, codes = protect_codes(raw_text, self.glossary)
 
         # Технические строки: после удаления кодов остался только мусор —
         # пробелы, знаки препинания, цифры. Такие строки переводить нельзя —
@@ -503,72 +618,127 @@ class RPGMakerProject:
         self.entries.append(TextEntry(
             text=protected, codes=codes, file=file, path=path,
             group_id=group_id, is_dialogue=is_dialogue,
-            needs_translation=needs_translation,
+            needs_translation=needs_translation, block=block,
         ))
 
     def _extract_event_list(self, event_list: list, file: str, base_path: tuple) -> None:
-        """Обрабатывает массив команд событий, склеивая подряд идущие 401 в группы.
-        Между блоками 401 может попадаться 101 (header с именем говорящего/плагин-тегами) —
-        она не разрывает диалоговую группу.
+        """Обрабатывает массив команд события.
+
+        Сообщения (101 + идущие за ней 401) извлекаются ЦЕЛЫМ БЛОКОМ, а не
+        построчно. Это принципиально: в JSON строки уже разбиты под ширину
+        окна, часто посреди предложения. Отправляя их по одной, мы заставляли
+        переводчик работать с обрывками — «Trigger» отдельно от «Condition:»
+        превращался в «спусковой крючок». Собранный блок уходит в переводчик
+        связным текстом, а обратно раскладывается в text_fit.fit_message.
         """
-        dialogue_group = 0
-        # Учитываем только содержательные «разрывы»: любой код кроме 401, 101 и комментариев
-        # сбрасывает группу. 101 между 401-ми — часть того же диалога (это смена портрета/имени).
-        DIALOGUE_NEUTRAL_CODES = {101, 108, 408}  # 108/408 — комментарии в эвенте
-        prev_dialogue_code = None
-        for i, cmd in enumerate(event_list):
+        i = 0
+        n = len(event_list)
+        while i < n:
+            cmd = event_list[i]
             if not isinstance(cmd, dict):
+                i += 1
                 continue
             code = cmd.get("code")
             params = cmd.get("parameters", [])
 
-            if code == 401 and isinstance(params, list) and params:
-                # Подряд идущие 401 (с возможным 101 между ними) = одно сообщение
-                if prev_dialogue_code != 401:
-                    dialogue_group += 1
-                gid = f"{file}:{base_path}:dlg{dialogue_group}"
-                self._add(params[0], file, base_path + (i, "parameters", 0),
-                          group_id=gid, is_dialogue=True)
-                prev_dialogue_code = 401
+            if code == 101:
+                block = self._collect_message_block(event_list, i, header=True)
+                if block is not None:
+                    self._add_message_block(event_list, file, base_path, block)
+                    i = block.last + 1
+                    continue
+                # 101 без единой строки 401 — переводим только имя говорящего
+                self._add_speaker_name(cmd, file, base_path, i)
+                i += 1
+                continue
 
-            elif code == 102 and isinstance(params, list) and params:
+            if code == 401:
+                block = self._collect_message_block(event_list, i, header=False)
+                if block is not None:
+                    self._add_message_block(event_list, file, base_path, block)
+                    i = block.last + 1
+                    continue
+                i += 1
+                continue
+
+            if code == 102 and isinstance(params, list) and params:
                 # Варианты выбора — params[0] список строк
                 choices = params[0]
                 if isinstance(choices, list):
                     for j, ch in enumerate(choices):
                         if isinstance(ch, str):
                             self._add(ch, file, base_path + (i, "parameters", 0, j))
-                prev_dialogue_code = code
 
             elif code == 402 and isinstance(params, list) and len(params) >= 2:
                 if isinstance(params[1], str):
                     self._add(params[1], file, base_path + (i, "parameters", 1))
-                prev_dialogue_code = code
 
             elif code == 405 and isinstance(params, list) and params:
                 if isinstance(params[0], str):
                     self._add(params[0], file, base_path + (i, "parameters", 0))
-                prev_dialogue_code = code
-
-            elif code == 101 and isinstance(params, list) and len(params) >= 5:
-                # MV/MZ: имя говорящего в параметре 4 (только в MZ; в MV это может быть face name)
-                if isinstance(params[4], str) and params[4].strip():
-                    self._add(params[4], file, base_path + (i, "parameters", 4))
-                # 101 НЕ сбрасывает diaolgue группу — это header следующего 401-блока
 
             elif code == 320 and isinstance(params, list) and len(params) >= 2:
                 if isinstance(params[1], str):
                     self._add(params[1], file, base_path + (i, "parameters", 1))
-                prev_dialogue_code = code
 
-            elif code in DIALOGUE_NEUTRAL_CODES:
-                # Нейтральные коды (комментарии, 101 без подходящих параметров)
-                # не сбрасывают группу
-                pass
+            i += 1
 
-            else:
-                # Любая другая команда разрывает диалоговую цепочку
-                prev_dialogue_code = code
+    @staticmethod
+    def _collect_message_block(event_list: list, start: int,
+                               header: bool) -> MessageBlock | None:
+        """Собирает окно сообщения, начиная с команды по индексу start.
+
+        Блок — это одна команда 101 и все идущие подряд за ней 401. Любая
+        другая команда закрывает блок: так устроен сам движок, который склеивает
+        именно эти 401 в одно окно.
+        """
+        header_index = start if header else None
+        first = start + 1 if header else start
+        j = first
+        while j < len(event_list):
+            cmd = event_list[j]
+            if not isinstance(cmd, dict) or cmd.get("code") != 401:
+                break
+            j += 1
+        if j == first:
+            return None
+
+        indent = 0
+        has_face = False
+        anchor = event_list[header_index] if header_index is not None else event_list[first]
+        if isinstance(anchor, dict):
+            indent = anchor.get("indent") or 0
+        if header_index is not None:
+            params = event_list[header_index].get("parameters") or []
+            # params[0] — имя файла портрета; непустое значение сдвигает текст
+            # вправо на 168 px, и в строку влезает заметно меньше.
+            has_face = bool(params and isinstance(params[0], str) and params[0].strip())
+
+        return MessageBlock(header_index=header_index, first=first, last=j - 1,
+                            indent=indent, has_face=has_face)
+
+    def _add_message_block(self, event_list: list, file: str, base_path: tuple,
+                           block: MessageBlock) -> None:
+        """Добавляет окно сообщения как одну единицу перевода."""
+        lines: list[str] = []
+        for idx in range(block.first, block.last + 1):
+            params = event_list[idx].get("parameters") or []
+            lines.append(params[0] if params and isinstance(params[0], str) else "")
+        raw = "\n".join(lines)
+
+        # Заголовок 101 у MZ несёт имя говорящего в params[4] — его переводим
+        # отдельной записью, окна оно не касается.
+        if block.header_index is not None:
+            self._add_speaker_name(event_list[block.header_index], file,
+                                   base_path, block.header_index)
+
+        self._add(raw, file, base_path, is_dialogue=True, block=block)
+
+    def _add_speaker_name(self, cmd: dict, file: str, base_path: tuple,
+                          index: int) -> None:
+        params = cmd.get("parameters") or []
+        if len(params) >= 5 and isinstance(params[4], str) and params[4].strip():
+            self._add(params[4], file, base_path + (index, "parameters", 4))
 
     def _extract_map_events(self, file: str) -> None:
         data = self._read(file)
@@ -645,29 +815,38 @@ class RPGMakerProject:
                     )
 
     def _is_referenced_by_script(self, text: str) -> bool:
-        """True if a DB name is mentioned in scripts/plugin commands/comments.
+        """True, если имя из БД упоминается в скриптах/плагин-командах/JS.
 
-        RPG Maker plugins often compare database names as literal strings. If a
-        translated name changes, the JSON remains valid but story progression can
-        break. Exact substring matching is intentionally conservative: if scripts
-        mention the same DB name, keep that name untouched.
+        Плагины часто сравнивают имена из базы как строковые литералы. Если
+        перевести такое имя, JSON останется валидным, а сюжет сломается.
+
+        Реализация — множество токенов, а не поиск подстроки по мегабайтам
+        текста. Раньше каждое имя прогонялось через `in` по склеенному
+        содержимому всех карт и всех JS: на средней игре это ~20 секунд
+        полностью замороженного интерфейса. Плюс поиск подстроки давал ложные
+        срабатывания — предмет «Poison» совпадал со словом «poison» в справке
+        любого плагина, и название молча оставалось непереведённым.
         """
-        if not text or len(text.strip()) < 2:
+        text = (text or "").strip()
+        if len(text) < 2:
             return False
-        refs = self._get_script_reference_text()
-        return text.strip() in refs
+        return text in self._get_script_reference_tokens()
 
-    def _get_script_reference_text(self) -> str:
-        if self._script_reference_text is not None:
-            return self._script_reference_text
+    def _get_script_reference_tokens(self) -> set[str]:
+        """Строковые литералы из скриптов игры — ровно то, с чем сравнивают имена."""
+        if self._script_reference_tokens is not None:
+            return self._script_reference_tokens
 
-        chunks: list[str] = []
+        tokens: set[str] = set()
 
         def add_scalars(value: Any) -> None:
             if isinstance(value, str):
-                chunks.append(value)
-            elif isinstance(value, (int, float)):
-                chunks.append(str(value))
+                tokens.update(_string_literals(value))
+                # Сама параметр-строка тоже может быть именем целиком:
+                # плагин-команда вида ["Открыть магазин", "Зелье"].
+                stripped = value.strip()
+                if 0 < len(stripped) <= 64:
+                    tokens.add(stripped)
             elif isinstance(value, list):
                 for item in value:
                     add_scalars(item)
@@ -696,24 +875,29 @@ class RPGMakerProject:
 
         for path in sorted(self.data_dir.glob("Map[0-9]*.json")):
             scan_obj(self._read(path.name))
+            # Карты держим в памяти только на время сканирования: на большой
+            # игре кэш всех карт — это сотни мегабайт впустую.
+            self._files_cache.pop(path.name, None)
         for name in ("CommonEvents.json", "Troops.json"):
             if (self.data_dir / name).exists():
                 scan_obj(self._read(name))
 
-        # Plugin and engine JS can also contain literal DB names. We only read
-        # text files near the selected data folder and cap very large files.
+        # Плагины и движок тоже сравнивают имена из БД. Берём только строковые
+        # литералы: комментарии и блоки @help больше не создают ложных совпадений.
         js_dir = self.data_dir.parent / "js"
         if js_dir.exists():
-            for js_path in js_dir.rglob("*.js"):
+            for js_path in sorted(js_dir.rglob("*.js")):
                 try:
-                    if js_path.stat().st_size > 2_000_000:
+                    if js_path.stat().st_size > 4_000_000:
                         continue
-                    chunks.append(js_path.read_text(encoding="utf-8", errors="ignore"))
+                    tokens.update(_string_literals(
+                        js_path.read_text(encoding="utf-8", errors="ignore")
+                    ))
                 except OSError:
                     continue
 
-        self._script_reference_text = "\n".join(chunks)
-        return self._script_reference_text
+        self._script_reference_tokens = tokens
+        return tokens
 
     def _extract_system(self) -> None:
         file = "System.json"
@@ -801,19 +985,26 @@ class RPGMakerProject:
         """Применяет переводы по индексам entries и записывает файлы.
 
         Возвращает статистику валидации плейсхолдеров:
-            {'total': N, 'with_codes': M, 'broken': K, 'broken_entries': [...]}
-        где broken — строки, в которых переводчик потерял управляющие коды.
+            {'total': N, 'with_codes': M, 'broken': K, 'skipped': K,
+             'rewrapped': R, 'extra_windows': W, 'broken_entries': [...]}
+        где broken — строки, в которых переводчик потерял управляющие коды,
+        rewrapped — сообщения, заново свёрстанные по ширине окна, а
+        extra_windows — сколько окон добавилось, потому что перевод длиннее.
         """
         stats = {
             "total": 0,
             "with_codes": 0,
             "broken": 0,
             "skipped": 0,
+            "rewrapped": 0,
+            "extra_windows": 0,
             "broken_entries": [],
         }
 
-        # Группируем по файлам
+        # Простые значения пишутся по пути; сообщения — пересборкой блока.
         by_file: dict[str, list[tuple[TextEntry, str]]] = {}
+        messages: dict[str, dict[tuple, list[tuple[TextEntry, str]]]] = {}
+
         for idx, translated in translations.items():
             if idx >= len(self.entries):
                 continue
@@ -822,15 +1013,15 @@ class RPGMakerProject:
 
             # Валидация плейсхолдеров перед восстановлением. Проверяем и строки
             # без исходных кодов: чужой <tN/> мог переехать сюда из соседней
-            # реплики. Повреждённый перевод не записываем вообще — английская
-            # исходная строка безопаснее видимого служебного мусора в игре.
+            # реплики. Повреждённый перевод не записываем вообще — исходная
+            # строка безопаснее видимого служебного мусора в игре.
             ok, missing = validate_placeholders(translated, len(entry.codes))
             if entry.codes:
                 stats["with_codes"] += 1
             if not ok:
                 stats["broken"] += 1
                 stats["skipped"] += 1
-                if len(stats["broken_entries"]) < 50:
+                if len(stats["broken_entries"]) < 200:
                     stats["broken_entries"].append({
                         "file": entry.file,
                         "missing": sorted(missing),
@@ -839,17 +1030,114 @@ class RPGMakerProject:
                 continue
 
             final = restore_codes(translated, entry.codes)
-            by_file.setdefault(entry.file, []).append((entry, final))
+            if entry.is_message:
+                messages.setdefault(entry.file, {}).setdefault(
+                    entry.path, []).append((entry, final))
+            else:
+                by_file.setdefault(entry.file, []).append((entry, final))
 
-        for file, items in by_file.items():
+        touched = set(by_file) | set(messages)
+        for file in sorted(touched):
             data = self._read(file)
             if data is None:
                 continue
-            for entry, value in items:
+            for entry, value in by_file.get(file, []):
                 _set_by_path(data, entry.path, value)
+            for list_path, items in messages.get(file, {}).items():
+                self._rebuild_message_list(data, list_path, items, stats)
             self._write(file, data)
 
         return stats
+
+    def _rebuild_message_list(self, data: Any, list_path: tuple,
+                              items: list[tuple[TextEntry, str]],
+                              stats: dict) -> None:
+        """Пересобирает список команд события с новой вёрсткой сообщений.
+
+        Переведённый текст заново переносится по РЕАЛЬНОЙ ширине окна, а если
+        строк стало больше, чем окно показывает, блок разворачивается в
+        несколько окон — каждое со своей копией заголовка 101. Без этого лишние
+        строки просто не помещались: игрок видел обрезанный текст, а хвост
+        фразы уезжал в следующее сообщение посреди слова.
+        """
+        try:
+            event_list = _get_by_path(data, list_path)
+        except (KeyError, IndexError, TypeError):
+            return
+        if not isinstance(event_list, list):
+            return
+
+        replacements: dict[int, tuple[TextEntry, str]] = {}
+        for entry, text in items:
+            block = entry.block
+            if block is None:
+                continue
+            anchor = block.header_index if block.header_index is not None else block.first
+            replacements[anchor] = (entry, text)
+
+        if not replacements:
+            return
+
+        rebuilt: list[Any] = []
+        i = 0
+        while i < len(event_list):
+            found = replacements.get(i)
+            if found is None:
+                rebuilt.append(event_list[i])
+                i += 1
+                continue
+
+            entry, text = found
+            block = entry.block
+            pages = self._layout_pages(text, block)
+            header = (event_list[block.header_index]
+                      if block.header_index is not None else None)
+
+            for page_no, lines in enumerate(pages):
+                if header is not None:
+                    # Второе и последующие окна получают копию заголовка:
+                    # тот же портрет, та же позиция, то же имя говорящего.
+                    rebuilt.append(header if page_no == 0 else _clone_command(header))
+                for line in lines:
+                    rebuilt.append({
+                        "code": 401,
+                        "indent": block.indent,
+                        "parameters": [line],
+                    })
+
+            stats["rewrapped"] += 1
+            if len(pages) > 1:
+                stats["extra_windows"] += len(pages) - 1
+            i = block.last + 1
+
+        event_list[:] = rebuilt
+
+    def _layout_pages(self, text: str, block: MessageBlock) -> list[list[str]]:
+        """Переносит текст сообщения по ширине окна и режет на окна."""
+        if self.measurer is None:
+            return [text.split("\n")]
+        max_lines = self.layout.max_lines
+        if block.header_index is None:
+            # Разложить на несколько окон без заголовка нечем — движок склеит
+            # их обратно в одно. Оставляем как есть: пусть лучше будет длинное
+            # окно, чем потерянные строки.
+            max_lines = 0
+        fitted = fit_message(text, self.measurer, has_face=block.has_face,
+                             max_lines=max_lines)
+        return fitted.pages
+
+
+def _clone_command(cmd: Any) -> Any:
+    """Копия команды события — заголовок повторяется для каждого окна."""
+    import copy
+    return copy.deepcopy(cmd)
+
+
+def _get_by_path(data: Any, path: tuple) -> Any:
+    obj = data
+    for key in path:
+        obj = obj[key]
+    return obj
 
 
 def _set_by_path(data: Any, path: tuple, value: Any) -> None:
@@ -1128,14 +1416,16 @@ class ProjectStats:
 
 
 def analyze_project(data_dir, group_dialogues: bool = True,
-                    crypto=None, i18n_field: str | None = None
+                    crypto=None, i18n_field: str | None = None,
+                    glossary=None, layout=None
                     ) -> tuple[ProjectStats, RPGMakerProject]:
     """Парсит проект и возвращает статистику. Без перевода и без записи.
     Если файлы зашифрованы, передай экземпляр GameCrypto.
     i18n_field — поле в I18NTexts.json для маршрута (например 'en_US')."""
     from core.lang_detect import detect_language
 
-    proj = RPGMakerProject(data_dir, crypto=crypto, i18n_field=i18n_field)
+    proj = RPGMakerProject(data_dir, crypto=crypto, i18n_field=i18n_field,
+                           glossary=glossary, layout=layout)
     entries = proj.extract_all()
 
     translatable = [e for e in entries if e.needs_translation]

@@ -13,17 +13,27 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from core.rpgmaker_parser import (
-    RPGMakerProject, build_translation_units,
-    count_placeholders, validate_placeholders, strip_placeholders,
-    restore_codes,
+    RPGMakerProject, count_placeholders, validate_placeholders, restore_codes,
 )
 
 
+def _position_key(entry) -> tuple:
+    """Стабильный ключ позиции для сопоставления оригинала с переводом.
+
+    У блоков сообщений `path` указывает на весь список команд события, поэтому
+    несколько окон в одном событии имеют одинаковый path. Различаем их по
+    индексу первой команды блока.
+    """
+    block = getattr(entry, "block", None)
+    if block is not None:
+        return (entry.file, entry.path, block.first)
+    return (entry.file, entry.path, None)
+
+
 def _unescape(text: str) -> str:
-    """Расэкранирует html-сущности для отображения (&lt; → <, и т.д.)."""
-    if not text or "&" not in text:
-        return text
-    return (text.replace("&lt;", "<").replace("&gt;", ">").replace("&amp;", "&"))
+    """Расэкранирование для показа — та же реализация, что и в парсере."""
+    from core.rpgmaker_parser import _unescape_html_entities
+    return _unescape_html_entities(text)
 
 
 @dataclass
@@ -34,22 +44,6 @@ class PreviewItem:
     translated: str        # переведённый текст (с кодами, как в выходном файле)
     codes_ok: bool         # целы ли управляющие коды
     issues: list[str] = field(default_factory=list)   # описания проблем
-
-
-def _read_raw_dialogues(data_dir: Path, crypto=None, i18n_field: str | None = None,
-                        max_events: int = 0) -> dict:
-    """Извлекает диалоги (склеенные по событиям) из проекта.
-    Возвращает {ключ_позиции: текст}. Ключ — кортеж пути, чтобы матчить
-    оригинал с переводом по одинаковой позиции в структуре."""
-    proj = RPGMakerProject(data_dir, crypto=crypto, i18n_field=i18n_field)
-    entries = proj.extract_all()
-    # Только диалоговые строки (401), которые реально переводятся
-    result = {}
-    for e in entries:
-        if e.is_dialogue and e.needs_translation:
-            # Ключ — путь до значения (одинаковый в исходнике и переводе)
-            result[(e.file, e.path)] = e
-    return result
 
 
 def build_preview(
@@ -92,7 +86,7 @@ def build_preview(
             proj_src = RPGMakerProject(source_dir, crypto=crypto, i18n_field=i18n_field)
             src_entries = proj_src.extract_all()
             for e in src_entries:
-                orig_by_pos[(e.file, e.path)] = e
+                orig_by_pos[_position_key(e)] = e
         except Exception:
             pass
 
@@ -101,8 +95,7 @@ def build_preview(
 
     items: list[PreviewItem] = []
     for tr_entry in sample:
-        pos = (tr_entry.file, tr_entry.path)
-        src_entry = orig_by_pos.get(pos)
+        src_entry = orig_by_pos.get(_position_key(tr_entry))
 
         # Восстанавливаем коды для отображения и расэкранируем html-сущности
         # (&lt; &gt; &amp;), которые могли остаться в protected-тексте.
