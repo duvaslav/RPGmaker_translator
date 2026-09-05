@@ -507,7 +507,8 @@ class RPGMakerProject:
     }
 
     def __init__(self, data_dir: Path, crypto=None, i18n_field: str | None = None,
-                 glossary=None, layout=None, fit_messages: bool = True):
+                 glossary=None, layout=None, fit_messages: bool = True,
+                 translate_map_tree: bool = False):
         self.data_dir = Path(data_dir)
         if not self.data_dir.exists():
             raise FileNotFoundError(f"Папка не найдена: {data_dir}")
@@ -516,6 +517,8 @@ class RPGMakerProject:
         self.crypto = crypto  # GameCrypto | None
         self.i18n_field = i18n_field   # имя поля в I18NTexts.json, или None
         self.glossary = glossary       # core.glossary.Glossary | None
+        # Переводить ли имена карт из MapInfos.json (метки дерева в редакторе).
+        self.translate_map_tree = translate_map_tree
         self._script_reference_tokens: set[str] | None = None
 
         # Вёрстка сообщений: расклейка перед переводом и перенос после него.
@@ -840,6 +843,11 @@ class RPGMakerProject:
         data = self._read(file)
         if not isinstance(data, list):
             return
+        # MapInfos.json — дерево карт в редакторе. Движок этот файл загружает,
+        # но нигде не показывает: игрок видит только displayName самой карты.
+        # Перевод этих строк тратит лимит API и ничего не даёт, а в проектах,
+        # где метки написаны по-японски, ещё и портит дерево в редакторе.
+        editor_only = file == "MapInfos.json" and not self.translate_map_tree
         for i, item in enumerate(data):
             if not isinstance(item, dict):
                 continue
@@ -849,8 +857,9 @@ class RPGMakerProject:
                     self._add(
                         val, file, (i, field_name),
                         force_technical=(
-                            field_name == "name"
-                            and self._is_referenced_by_script(val)
+                            editor_only
+                            or (field_name == "name"
+                                and self._is_referenced_by_script(val))
                         ),
                     )
 

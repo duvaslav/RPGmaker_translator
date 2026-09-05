@@ -510,6 +510,54 @@ def test_wrapping_preserves_every_character() -> None:
                      f"characters preserved: {text[:40]!r}")
 
 
+def test_mv_resolution_comes_from_plugins_js() -> None:
+    """Регрессия: у MV разрешение лежит в plugins.js, а не в System.json.
+
+    Игра с Community_Basic screenWidth=1000 верстелась по стоковым 816 px,
+    и текст переносился на 184 px раньше края окна.
+    """
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        (root / "data").mkdir()
+        (root / "data" / "System.json").write_text("{}", encoding="utf-8")
+        js = root / "js"
+        js.mkdir()
+        (js / "rpg_core.js").write_text("// MV", encoding="utf-8")
+        (js / "plugins.js").write_text(
+            'var $plugins =\n[\n'
+            '{"name":"Community_Basic","status":true,'
+            '"parameters":{"screenWidth":"1000","screenHeight":"800"}},\n'
+            '{"name":"Disabled_Wide","status":false,'
+            '"parameters":{"screenWidth":"2000"}}\n];\n',
+            encoding="utf-8")
+
+        layout = MessageLayout.detect(root / "data")
+        assert_equal(layout.engine, "MV", "MV detected")
+        assert_equal(layout.box_width, 1000, "width taken from the enabled plugin")
+        assert_equal(layout.available_width(), 964, "text area = 1000 - 2*18")
+
+
+def test_map_tree_labels_are_not_translated() -> None:
+    """Регрессия: имена из MapInfos.json — метки дерева в редакторе.
+
+    Движок этот файл загружает, но игроку не показывает: видно только
+    displayName самой карты. Перевод таких строк жёг лимит API впустую.
+    """
+    with tempfile.TemporaryDirectory() as td:
+        data_dir = Path(td)
+        (data_dir / "MapInfos.json").write_text(json.dumps([
+            None, {"id": 1, "name": "Village square", "parentId": 0},
+        ]), encoding="utf-8")
+
+        default = RPGMakerProject(data_dir).extract_all()
+        assert_equal(default[0].needs_translation, False,
+                     "editor label skipped by default")
+
+        opted_in = RPGMakerProject(data_dir, translate_map_tree=True).extract_all()
+        assert_equal(opted_in[0].needs_translation, True,
+                     "still translatable when explicitly requested")
+
+
 # ────────────────────────────────────────────────────────────────────────────
 # Безопасность путей
 # ────────────────────────────────────────────────────────────────────────────
@@ -610,6 +658,8 @@ TESTS = [
     test_identifier_lists_are_technical,
     test_kinsoku_never_overflows_the_window,
     test_wrapping_preserves_every_character,
+    test_mv_resolution_comes_from_plugins_js,
+    test_map_tree_labels_are_not_translated,
     test_output_dir_guard,
     test_runtime_text_wrap_installer,
 ]

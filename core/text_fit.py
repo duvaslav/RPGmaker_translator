@@ -92,7 +92,7 @@ class MessageLayout:
         layout.padding = 18 if engine == "MV" else 12
         layout.font_size = 28 if engine == "MV" else 26
 
-        # System.json → advanced.fontSize / uiAreaWidth
+        # MZ хранит размеры в System.json → advanced
         system = _load_json(data_dir / "System.json")
         advanced = (system or {}).get("advanced") if isinstance(system, dict) else None
         if isinstance(advanced, dict):
@@ -103,7 +103,16 @@ class MessageLayout:
             if isinstance(width, int) and 320 <= width <= 4096:
                 layout.box_width = width
 
+        # MV хранит их в параметрах плагина (Community_Basic, ChangeResolution
+        # и подобных) — в System.json ключа advanced просто нет. Без этого шага
+        # игра с разрешением 1000 px верстается по стоковым 816 и текст
+        # переносится заметно раньше края окна.
         if www is not None:
+            width, size = _plugin_screen_metrics(www / "js" / "plugins.js")
+            if width:
+                layout.box_width = width
+            if size:
+                layout.font_size = size
             layout.font_path = _pick_font(www / "fonts")
         return layout
 
@@ -145,6 +154,63 @@ def _pick_font(fonts_dir: Path) -> Path | None:
         for path in pool:
             if path.suffix.lower() in (".ttf", ".otf"):
                 return path
+    return None
+
+
+# Имена параметров, которыми плагины MV задают ширину экрана и кегль.
+# Сравнение идёт по строке без пробелов, подчёркиваний и регистра.
+_WIDTH_KEYS = ("screenwidth", "width", "boxwidth", "画面幅", "windowwidth",
+               "changewindowwidthto")
+_FONT_KEYS = ("fontsize", "standardfontsize", "messagefontsize", "フォントサイズ")
+
+
+def _norm_key(key: str) -> str:
+    return re.sub(r'[\s_\-]+', '', key).lower()
+
+
+def _plugin_screen_metrics(plugins_js: Path) -> tuple[int | None, int | None]:
+    """Читает ширину экрана и кегль из js/plugins.js (движок MV).
+
+    Файл — это присваивание `var $plugins = [ … ];`, поэтому вырезаем массив
+    и разбираем его как JSON. Отключённые плагины (`status: false`) не влияют
+    на игру и потому игнорируются.
+    """
+    try:
+        text = plugins_js.read_text(encoding="utf-8-sig", errors="ignore")
+    except OSError:
+        return None, None
+    try:
+        start = text.index("[")
+        entries = json.loads(text[start:text.rindex("]") + 1])
+    except (ValueError, json.JSONDecodeError):
+        return None, None
+
+    width = font = None
+    for entry in entries:
+        if not isinstance(entry, dict) or not entry.get("status"):
+            continue
+        params = entry.get("parameters")
+        if not isinstance(params, dict):
+            continue
+        for key, value in params.items():
+            norm = _norm_key(key)
+            number = _as_int(value)
+            if number is None:
+                continue
+            if width is None and norm in _WIDTH_KEYS and 320 <= number <= 4096:
+                width = number
+            elif font is None and norm in _FONT_KEYS and 8 <= number <= 96:
+                font = number
+    return width, font
+
+
+def _as_int(value) -> int | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str) and value.strip().isdigit():
+        return int(value.strip())
     return None
 
 
