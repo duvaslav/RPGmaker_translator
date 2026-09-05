@@ -291,7 +291,11 @@ class TextMeasurer:
 
 # Конец предложения: после этих знаков перенос почти наверняка авторский.
 _SENTENCE_END = ".!?…。！？♪〜~）)]】」』"
-# Строка-подпись: заканчивается двоеточием (часто «Имя:» перед репликой).
+# Знаки, которые НИКОГДА не заканчивают предложение. Строка, оборванная на
+# запятой, продолжается на следующей — склеиваем независимо от её длины.
+# Для японского это главный признак: там автор переносит задолго до края окна
+# (типично ~19 знаков при окне на 30), поэтому порога по ширине не хватает.
+_MID_SENTENCE = ",、，"
 _SOFT_RATIO = 0.72
 
 
@@ -300,6 +304,11 @@ def _ends_sentence(visible: str) -> bool:
     if not stripped:
         return True
     return stripped[-1] in _SENTENCE_END
+
+
+def _ends_mid_sentence(visible: str) -> bool:
+    stripped = visible.rstrip()
+    return bool(stripped) and stripped[-1] in _MID_SENTENCE
 
 
 def unwrap_message(text: str, measurer: TextMeasurer,
@@ -336,7 +345,13 @@ def unwrap_message(text: str, measurer: TextMeasurer,
             visible.strip() != ""
             and nxt.strip() != ""
             and not _ends_sentence(visible)
-            and measurer.width(current) >= avail * _SOFT_RATIO
+            and (
+                # Запятая в конце — фраза точно продолжается, длина не важна.
+                _ends_mid_sentence(visible)
+                # Иначе судим по длине: строка, дотянувшаяся почти до края
+                # окна, оборвана вёрсткой, а короткая — волей автора.
+                or measurer.width(current) >= avail * _SOFT_RATIO
+            )
         )
         if soft:
             current = _join_wrapped(current, nxt)
@@ -404,7 +419,7 @@ def wrap_paragraph(text: str, measurer: TextMeasurer, avail: float) -> list[str]
             current = tail
     if current.strip():
         lines.append(current.rstrip())
-    return _apply_kinsoku(lines) or [text]
+    return _apply_kinsoku(lines, measurer, avail) or [text]
 
 
 # Токен = управляющий код целиком, либо слово с ведущими пробелами, либо
@@ -477,18 +492,31 @@ def _splits_code(text: str, idx: int) -> bool:
     return False
 
 
-def _apply_kinsoku(lines: list[str]) -> list[str]:
-    """Не даём строке начинаться с запятой/точки и кончаться открывающей скобкой."""
+def _apply_kinsoku(lines: list[str], measurer: TextMeasurer,
+                   avail: float) -> list[str]:
+    """Не даём строке начинаться с запятой/точки и кончаться открывающей скобкой.
+
+    Каждый перенос знака проверяется по ширине: правило кинсоку — это
+    улучшение вида, и оно не имеет права выталкивать строку за край окна.
+    Без проверки текст, забитый многоточиями («…» нельзя оставлять в начале
+    строки), наращивал предыдущую строку до переполнения.
+    """
     result = list(lines)
     for i in range(1, len(result)):
         while result[i] and result[i][0] in _NO_LINE_START and result[i - 1]:
-            result[i - 1] += result[i][0]
+            moved = result[i - 1] + result[i][0]
+            if measurer.width(moved) > avail:
+                break            # красивее не вышло — важнее не вылезти за край
+            result[i - 1] = moved
             result[i] = result[i][1:].lstrip()
             if not result[i]:
                 break
     for i in range(len(result) - 1):
         while result[i] and result[i][-1] in _NO_LINE_END:
-            result[i + 1] = result[i][-1] + result[i + 1]
+            moved = result[i][-1] + result[i + 1]
+            if measurer.width(moved) > avail:
+                break
+            result[i + 1] = moved
             result[i] = result[i][:-1].rstrip()
             if not result[i]:
                 break

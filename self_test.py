@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import json
+import re
 import tempfile
 from pathlib import Path
 
@@ -27,6 +28,7 @@ from core.text_fit import (
     TextMeasurer,
     fit_message,
     unwrap_message,
+    wrap_paragraph,
 )
 from core.text_layout import install_runtime_text_wrap
 from core.translators import _keep_entities, _placeholders_intact
@@ -452,6 +454,62 @@ def test_rebuild_keeps_custom_command_fields() -> None:
         assert_equal(originals[0], "前半\n後半。", "both originals preserved in order")
 
 
+def test_identifier_lists_are_technical() -> None:
+    """Регрессия: перечисление ресурсов через запятую уходило в переводчик.
+
+    Плагины хранят в поле «имя актёра» пары идентификаторов картинок. Одиночный
+    путь распознавался, а список — нет: запятая в шаблон пути не входит. После
+    перевода такое значение ломало показ картинок.
+    """
+    technical = [
+        "TaikiSperm/11Zakozu,TaikiSperm/11ZakozuRanshi",
+        "TaikiSperm/39Founder ,TaikiSperm/39Founder Ranshi",
+        "Bote0/00Kenji",
+        "HP, MP",
+    ]
+    for text in technical:
+        assert_equal(is_probably_technical_text(text), True, f"technical {text}")
+
+    translatable = ["Iron Sword, Potion", "Привет, мир!", "おおネズミ",
+                    "Ты идёшь в город, а он ждёт"]
+    for text in translatable:
+        assert_equal(is_probably_technical_text(text), False, f"translatable {text}")
+
+
+def test_kinsoku_never_overflows_the_window() -> None:
+    """Регрессия: правило кинсоку выталкивало строку за край окна.
+
+    «…» нельзя оставлять в начале строки, поэтому знак переносился в конец
+    предыдущей — раньше без проверки ширины. На тексте из сплошных многоточий
+    строка вырастала за габарит окна.
+    """
+    measurer = _measurer("MZ")
+    avail = measurer.layout.available_width()
+    text = "\\I[31]" + "ез……ез♡" * 12
+    lines = wrap_paragraph(text, measurer, avail)
+    for line in lines:
+        assert_true(measurer.width(line) <= avail,
+                    f"kinsoku kept the line inside {avail}px: {measurer.width(line):.0f}px")
+    assert_equal("".join(lines).replace(" ", ""), text.replace(" ", ""),
+                 "no character lost or added while wrapping")
+
+
+def test_wrapping_preserves_every_character() -> None:
+    """Вёрстка не имеет права терять или добавлять знаки — только переносы."""
+    measurer = _measurer("MZ")
+    samples = [
+        "\\C[6]出撃していたピュアエレメンツが敗北し、敵に捕らわれてしまったようです。",
+        "\\I[31]" + "ез……ез♡" * 20,
+        "Короткая строка.",
+        "Очень длинное предложение " * 12,
+    ]
+    for text in samples:
+        fitted = fit_message(text, measurer)
+        flat = "".join(line for page in fitted.pages for line in page)
+        assert_equal(re.sub(r"\s+", "", flat), re.sub(r"\s+", "", text),
+                     f"characters preserved: {text[:40]!r}")
+
+
 # ────────────────────────────────────────────────────────────────────────────
 # Безопасность путей
 # ────────────────────────────────────────────────────────────────────────────
@@ -549,6 +607,9 @@ TESTS = [
     test_message_block_is_rewrapped_into_windows,
     test_glossary_only_string_is_substituted_without_api,
     test_rebuild_keeps_custom_command_fields,
+    test_identifier_lists_are_technical,
+    test_kinsoku_never_overflows_the_window,
+    test_wrapping_preserves_every_character,
     test_output_dir_guard,
     test_runtime_text_wrap_installer,
 ]

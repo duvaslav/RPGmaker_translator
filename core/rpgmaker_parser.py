@@ -394,7 +394,44 @@ def is_probably_technical_text(raw_text: str) -> bool:
         if pattern.search(token):
             return True
 
+    # Перечисление идентификаторов через запятую: плагины хранят в поле «имя»
+    # списки вида «TaikiSperm/11Zakozu,TaikiSperm/11ZakozuRanshi». Каждая часть
+    # по отдельности распознаётся как путь к ресурсу, а строка целиком — нет,
+    # потому что запятая в шаблон пути не входит. Такое значение уходило
+    # переводчику и после перевода ломало показ картинок.
+    if _is_identifier_list(token):
+        return True
+
     return False
+
+
+_LIST_SEPARATOR = re.compile(r'\s*[;,]\s*')
+
+
+def _is_identifier_list(token: str) -> bool:
+    """True, если строка — перечисление технических идентификаторов."""
+    if not _LIST_SEPARATOR.search(token):
+        return False
+    parts = [p for p in _LIST_SEPARATOR.split(token) if p.strip()]
+    if len(parts) < 2:
+        return False
+    # Рекурсии нет: части уже без разделителя, поэтому проверяем их напрямую
+    # теми же правилами, что и одиночное значение.
+    for part in parts:
+        part = part.strip()
+        if not part:
+            return False
+        if part.lower() in SHORT_UI_TOKENS:
+            continue
+        if any(pattern.search(part) for pattern in TECHNICAL_TEXT_PATTERNS):
+            continue
+        if re.fullmatch(r'[A-Za-z_$][A-Za-z0-9_$-]{0,31}', part) and (
+            '_' in part or '$' in part or any(ch.isdigit() for ch in part)
+            or part.isupper() or part[:1].islower()
+        ):
+            continue
+        return False
+    return True
 
 
 # ────────────────────────────────────────────────────────────────────────────
