@@ -4,6 +4,7 @@
 """
 from __future__ import annotations
 
+import json
 import shutil
 import threading
 import traceback
@@ -360,6 +361,26 @@ class TranslationWorker(QThread):
             translation_error = e
             self.log.emit("error", f"Непредвиденная ошибка: {e}")
             translated_texts = self._recover_from_cache(unit_texts, cache, self.route.stages())
+
+        failed_items = chain_stats.get("failed_items") or []
+        if failed_items:
+            # Квитанция по каждой строке, которую переводчик не смог отдать в
+            # приемлемом виде. «Перевод завершён» не должно означать «всё
+            # переведено»: эти строки остались исходным текстом.
+            report_path = self.output_dir / "_translation_failures.json"
+            try:
+                report_path.write_text(
+                    json.dumps({"count": len(failed_items), "items": failed_items},
+                               ensure_ascii=False, indent=1),
+                    encoding="utf-8",
+                )
+                self.log.emit(
+                    "warn",
+                    f"⚠ {len(failed_items)} строк не прошли проверку и остались "
+                    f"исходным текстом. Список: {report_path.name}",
+                )
+            except OSError as e:
+                self.log.emit("warn", f"Не удалось записать отчёт об отказах: {e}")
 
         if chain_stats.get("rejected_placeholders"):
             self.log.emit(

@@ -712,6 +712,36 @@ def _reply(pairs) -> str:
                       ensure_ascii=False)
 
 
+def test_item_ids_are_unique_within_a_scene():
+    """Идентификатор обязан различать соседние окна одной страницы.
+
+    У окна сообщения путь ведёт к СПИСКУ команд события, а не к отдельной
+    строке, поэтому все окна одной страницы имели один и тот же путь. На
+    реальной игре 35 877 единиц из 39 717 делили идентификатор с соседями:
+    ответ модели на такой пакет отвергался целиком как содержащий повтор id,
+    и вся страница уходила на поэлементный ремонт.
+    """
+    from core.rpgmaker_parser import item_id_for
+
+    page = [
+        {"code": 101, "parameters": ["", 0, 0, 2], "indent": 0},
+        {"code": 401, "parameters": ["First window."], "indent": 0},
+        {"code": 0, "parameters": [], "indent": 0},
+        {"code": 101, "parameters": ["", 0, 0, 2], "indent": 0},
+        {"code": 401, "parameters": ["Second window."], "indent": 0},
+        {"code": 0, "parameters": [], "indent": 0},
+    ]
+    data = {"events": [None, {"id": 1, "pages": [{"list": page}]}]}
+    with tempfile.TemporaryDirectory() as tmp:
+        (Path(tmp) / "Map001.json").write_text(json.dumps(data), encoding="utf-8")
+        entries = RPGMakerProject(Path(tmp)).extract_all()
+
+    ids = [item_id_for(e) for e in entries]
+    assert_equal(len(set(ids)), len(ids), f"идентификаторы повторяются: {ids}")
+    # И оба окна обязаны остаться в одной сцене — иначе развалится контекст.
+    assert_equal(len({e.scope for e in entries}), 1, "окна разошлись по сценам")
+
+
 def test_llm_validator_catches_documented_failures():
     """F-001/F-003/F-004: подтверждённые отказы модели обязаны отклоняться.
 
@@ -1060,6 +1090,7 @@ TESTS = [
     test_output_dir_guard,
     test_runtime_text_wrap_installer,
     # ── Локальная модель ────────────────────────────────────────────────────
+    test_item_ids_are_unique_within_a_scene,
     test_llm_validator_catches_documented_failures,
     test_llm_response_parsing_rejects_broken_batches,
     test_llm_repairs_single_item_without_touching_the_rest,

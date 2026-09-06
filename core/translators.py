@@ -629,6 +629,9 @@ def translate_with_chain(
     current_items = list(items) if items is not None else None
     if current_items is not None and len(current_items) != len(current):
         raise ValueError("items должен быть той же длины, что и texts")
+    # Поимённые квитанции об отказах: без них «перевод завершён» скрывал бы
+    # строки, которые остались непереведёнными, и вычитывать их было бы негде.
+    failed_items: list[dict] = []
     stages = cfg.route.stages()
     rejected = 0
     stage_count = len(stages)
@@ -778,11 +781,19 @@ def translate_with_chain(
         if should_stop and should_stop():
             break
 
+        for item_id, source_text, problems in getattr(translator, "failures", []):
+            failed_items.append({
+                "id": item_id, "stage": f"{src}→{dst}", "provider": provider_name,
+                "source": source_text, "problems": list(problems),
+            })
+
         current = translated
         current_contexts = translated_contexts
 
     if rejected and stats is not None:
         stats["rejected_placeholders"] = rejected
+    if stats is not None and failed_items:
+        stats["failed_items"] = failed_items
     return current
 
 

@@ -315,6 +315,7 @@ class LocalLLMTranslator(Translator):
         }
         content = self._chat(self.system_prompt, user_payload, ids)
 
+        batch_problem = ""
         try:
             mapping = parse_response(content, ids)
         except ResponseError as e:
@@ -325,6 +326,10 @@ class LocalLLMTranslator(Translator):
                     f"Ответ модели не соответствует контракту: {e}",
                     self.name, True,
                 )
+            # Причину надо запомнить: иначе в квитанции у всех элементов
+            # пакета оказалось бы «элемента нет в ответе», и по отчёту было бы
+            # не понять, что на самом деле сломался ответ целиком.
+            batch_problem = f"ответ пакета отклонён ({e})"
             mapping = {}
 
         out: list[str] = []
@@ -339,7 +344,10 @@ class LocalLLMTranslator(Translator):
                 out.append(candidate)
                 continue
 
-            problems = list(verdict.problems) if verdict else ["элемента нет в ответе"]
+            if verdict is not None:
+                problems = list(verdict.problems)
+            else:
+                problems = [batch_problem or "элемента нет в ответе"]
             repaired = self._repair(item, src, dst)
             if repaired:
                 self.stats["accepted"] += 1

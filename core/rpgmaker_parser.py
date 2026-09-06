@@ -1420,13 +1420,25 @@ def _unit_meta(entries: list[TextEntry], start: int, end: int,
 
 
 def item_id_for(entry: TextEntry) -> str:
-    """Идентификатор элемента: файл и путь в JSON.
+    """Идентификатор элемента: файл, путь в JSON и начало окна сообщения.
 
     Берётся из настоящего положения в исходнике, а не из номера в пакете:
     номер меняется от запуска к запуску, путь — нет. Это позволяет
     сопоставлять ответ модели по идентификатору, а не по позиции.
+
+    Номер команды в конце обязателен. У окна сообщения путь ведёт к СПИСКУ
+    команд события, а не к отдельной строке, поэтому все окна одной страницы
+    имеют один и тот же путь. Без этого различителя на реальной игре 35 877
+    единиц из 39 717 делили идентификатор с соседями, и любой пакет с двумя
+    окнами одной страницы отвергался целиком как ответ с повтором id.
     """
-    return entry.file + ":" + "/".join(str(x) for x in entry.path)
+    ident = entry.file + ":" + "/".join(str(x) for x in entry.path)
+    if entry.block is None:
+        return ident
+    anchor = entry.block.header_index
+    if anchor is None:
+        anchor = entry.block.first
+    return f"{ident}#{anchor}"
 
 
 def location_of(entry: TextEntry) -> dict:
