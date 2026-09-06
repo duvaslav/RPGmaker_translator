@@ -12,13 +12,15 @@ from PyQt6.QtWidgets import (
     QLabel, QPushButton, QLineEdit, QComboBox, QCheckBox, QSpinBox, QGroupBox,
     QFileDialog, QPlainTextEdit, QProgressBar, QTabWidget, QMessageBox,
     QFrame, QScrollArea, QDialog, QListWidget, QListWidgetItem,
-    QAbstractItemView, QTextBrowser,
+    QAbstractItemView, QTextBrowser, QDoubleSpinBox, QTextEdit,
 )
 
 from core.config import load_config, save_config
 from core.rpgmaker_parser import ProjectStats
-from core.translators import TranslationRoute
-from core.worker import TranslationWorker, AnalysisWorker, KeySearchWorker
+from core.translators import LOCAL_LLM, TranslationRoute, needs_api_key, provider_names
+from core.worker import (
+    TranslationWorker, AnalysisWorker, KeySearchWorker, LocalLLMProbeWorker,
+)
 
 
 # ────────────────────────────────────────────────────────────────────────────
@@ -238,7 +240,7 @@ LANGUAGES = [
 ]
 LANG_DICT = dict(LANGUAGES)
 
-PROVIDERS = ["DeepL", "Google", "Yandex"]
+PROVIDERS = provider_names()
 
 
 def lang_display(code: str) -> str:
@@ -304,6 +306,7 @@ class MainWindow(QMainWindow):
 
         self.tabs.addTab(wrap_in_scroll(self._build_translate_tab()), "Перевод")
         self.tabs.addTab(wrap_in_scroll(self._build_keys_tab()), "API-ключи")
+        self.tabs.addTab(wrap_in_scroll(self._build_local_llm_tab()), "Локальная модель")
 
         # Низ: фаза + прогресс
         bottom = QVBoxLayout()
@@ -766,6 +769,257 @@ class MainWindow(QMainWindow):
         lay.addStretch()
         return w
 
+    def _build_local_llm_tab(self) -> QWidget:
+        """Настройки локальной модели.
+
+        Здесь только КЛИЕНТ. Приложение не запускает и не останавливает
+        LM Studio, не загружает и не выгружает модель: сервером управляет
+        пользователь, а неявное вмешательство в чужой процесс — источник
+        сюрпризов вроде занятой видеопамяти после выхода из программы.
+        """
+        cfg = self.config["local_llm"]
+        w = QWidget()
+        lay = QVBoxLayout(w)
+        lay.setContentsMargins(16, 18, 16, 16)
+        lay.setSpacing(14)
+
+        info = QLabel(
+            "Перевод локальной моделью через OpenAI-совместимый API "
+            "(LM Studio и подобные). Ключ не нужен, интернет не нужен, "
+            "текст игры никуда не уходит.<br><br>"
+            "Модель — не переводчик, а исполнитель инструкции: она может "
+            "потерять управляющий код или переставить его. Поэтому каждый "
+            "перевод проверяется, испорченное переспрашивается по одному, а "
+            "непрошедшее остаётся исходным текстом и попадает в отчёт — "
+            "<b>ни в игру, ни в кэш такое не пишется</b>."
+        )
+        info.setObjectName("hint")
+        info.setWordWrap(True)
+        info.setTextFormat(Qt.TextFormat.RichText)
+        lay.addWidget(info)
+
+        # ── Подключение ─────────────────────────────────────────────────────
+        conn = QGroupBox("ПОДКЛЮЧЕНИЕ")
+        cg = QGridLayout(conn)
+        cg.setColumnStretch(1, 1)
+
+        cg.addWidget(QLabel("Адрес сервера"), 0, 0)
+        self.llm_base_url = QLineEdit(cfg["base_url"])
+        self.llm_base_url.setPlaceholderText("http://127.0.0.1:1234/v1")
+        cg.addWidget(self.llm_base_url, 0, 1, 1, 2)
+
+        cg.addWidget(QLabel("Идентификатор модели"), 1, 0)
+        self.llm_model = QLineEdit(cfg["model"])
+        self.llm_model.setPlaceholderText("qwen3.5-4b-rpg-ru-safe")
+        cg.addWidget(self.llm_model, 1, 1, 1, 2)
+
+        model_hint = QLabel(
+            "Имя должно совпадать с тем, что отдаёт /v1/models, символ в символ. "
+            "Похожее имя другой сборки даст другой перевод и другой кэш."
+        )
+        model_hint.setObjectName("hint")
+        model_hint.setWordWrap(True)
+        cg.addWidget(model_hint, 2, 0, 1, 3)
+
+        self.llm_allow_remote = QCheckBox(
+            "Разрешить нелокальный адрес (по умолчанию только 127.0.0.1)"
+        )
+        self.llm_allow_remote.setChecked(bool(cfg["allow_remote"]))
+        self.llm_allow_remote.setToolTip(
+            "В запросах едет текст игры. Выставлять порт модели в сеть без "
+            "необходимости не стоит."
+        )
+        cg.addWidget(self.llm_allow_remote, 3, 0, 1, 3)
+
+        test_row = QHBoxLayout()
+        self.llm_test_btn = QPushButton("Проверить соединение")
+        self.llm_test_btn.clicked.connect(self._test_local_llm)
+        test_row.addWidget(self.llm_test_btn)
+        self.llm_test_label = QLabel("Сервер должен быть запущен заранее.")
+        self.llm_test_label.setObjectName("hint")
+        self.llm_test_label.setWordWrap(True)
+        test_row.addWidget(self.llm_test_label, 1)
+        cg.addLayout(test_row, 4, 0, 1, 3)
+        lay.addWidget(conn)
+
+        # ── Генерация ───────────────────────────────────────────────────────
+        gen = QGroupBox("ГЕНЕРАЦИЯ")
+        gg = QGridLayout(gen)
+        gg.setColumnStretch(5, 1)
+
+        gg.addWidget(QLabel("Температура"), 0, 0)
+        self.llm_temperature = QDoubleSpinBox()
+        self.llm_temperature.setRange(0.0, 2.0)
+        self.llm_temperature.setSingleStep(0.1)
+        self.llm_temperature.setValue(float(cfg["temperature"]))
+        self.llm_temperature.setToolTip(
+            "0 — воспроизводимый результат. Он же означает, что повторный "
+            "запрос с тем же текстом даст тот же ответ, включая ошибочный: "
+            "поэтому испорченное переспрашивается другой инструкцией."
+        )
+        gg.addWidget(self.llm_temperature, 0, 1)
+
+        gg.addWidget(QLabel("top_p"), 0, 2)
+        self.llm_top_p = QDoubleSpinBox()
+        self.llm_top_p.setRange(0.0, 1.0)
+        self.llm_top_p.setSingleStep(0.05)
+        self.llm_top_p.setValue(float(cfg["top_p"]))
+        gg.addWidget(self.llm_top_p, 0, 3)
+
+        gg.addWidget(QLabel("top_k"), 0, 4)
+        self.llm_top_k = QSpinBox()
+        self.llm_top_k.setRange(0, 200)
+        self.llm_top_k.setValue(int(cfg["top_k"]))
+        gg.addWidget(self.llm_top_k, 0, 5)
+
+        gg.addWidget(QLabel("Размер пакета"), 1, 0)
+        self.llm_batch = QSpinBox()
+        self.llm_batch.setRange(1, 20)
+        self.llm_batch.setValue(int(cfg["batch_size"]))
+        self.llm_batch.setToolTip(
+            "5 — безопасно при 16 ГиБ ОЗУ. 10 быстрее и проверен на 32 ГиБ. "
+            "20 быстрее ещё на 2 %, но на нём терялся управляющий код."
+        )
+        gg.addWidget(self.llm_batch, 1, 1)
+
+        gg.addWidget(QLabel("Таймаут, с"), 1, 2)
+        self.llm_timeout = QSpinBox()
+        self.llm_timeout.setRange(10, 900)
+        self.llm_timeout.setValue(int(cfg["timeout"]))
+        gg.addWidget(self.llm_timeout, 1, 3)
+
+        gg.addWidget(QLabel("Контекст"), 1, 4)
+        self.llm_context = QComboBox()
+        self.llm_context.addItem("1 реплика до и после (по умолчанию)", 1)
+        self.llm_context.addItem("3 до и 3 после (спорные места)", 3)
+        self.llm_context.addItem("Без контекста", 0)
+        self._set_combo_value(self.llm_context, int(cfg["context_window"]))
+        self.llm_context.setToolTip(
+            "Контекст берётся только внутри одного события и одной страницы. "
+            "Больше — не значит лучше: на широком контексте модель чаще теряла "
+            "управляющие коды."
+        )
+        gg.addWidget(self.llm_context, 1, 5)
+
+        self.llm_json_schema = QCheckBox(
+            "Строгая JSON-схема ответа (настоятельно рекомендуется)"
+        )
+        self.llm_json_schema.setChecked(bool(cfg["use_json_schema"]))
+        self.llm_json_schema.setToolTip(
+            "Без схемы модель отвечала корректным JSON в 13 случаях из 15, а "
+            "точными идентификаторами — в 11 из 15."
+        )
+        gg.addWidget(self.llm_json_schema, 2, 0, 1, 6)
+
+        self.llm_repair = QCheckBox(
+            "Переспрашивать испорченные строки по одной (1 попытка)"
+        )
+        self.llm_repair.setChecked(int(cfg["repair_retries"]) > 0)
+        gg.addWidget(self.llm_repair, 3, 0, 1, 6)
+        lay.addWidget(gen)
+
+        # ── Инструкция модели ───────────────────────────────────────────────
+        prompt_box = QGroupBox("ИНСТРУКЦИЯ МОДЕЛИ")
+        pg = QVBoxLayout(prompt_box)
+        prompt_hint = QLabel(
+            "Из трёх проверенных формулировок эта дала лучший результат. "
+            "Многословный вариант сработал хуже — длина инструкции не улучшает "
+            "дисциплину модели. Изменение инструкции обнуляет кэш переводов: "
+            "прежний перевод был ответом на другой вопрос."
+        )
+        prompt_hint.setObjectName("hint")
+        prompt_hint.setWordWrap(True)
+        pg.addWidget(prompt_hint)
+
+        from core.local_llm import DEFAULT_SYSTEM_PROMPT
+        self.llm_prompt = QTextEdit()
+        self.llm_prompt.setAcceptRichText(False)
+        self.llm_prompt.setPlainText(cfg["system_prompt"] or DEFAULT_SYSTEM_PROMPT)
+        self.llm_prompt.setMinimumHeight(110)
+        pg.addWidget(self.llm_prompt)
+
+        prompt_row = QHBoxLayout()
+        prompt_row.addStretch()
+        restore = QPushButton("Вернуть проверенную инструкцию")
+        restore.clicked.connect(
+            lambda: self.llm_prompt.setPlainText(DEFAULT_SYSTEM_PROMPT)
+        )
+        prompt_row.addWidget(restore)
+        pg.addLayout(prompt_row)
+        lay.addWidget(prompt_box)
+
+        save_row = QHBoxLayout()
+        save_row.addStretch()
+        save_btn = QPushButton("Сохранить настройки")
+        save_btn.setObjectName("primary")
+        save_btn.clicked.connect(self._save_local_llm)
+        save_row.addWidget(save_btn)
+        lay.addLayout(save_row)
+
+        lay.addStretch()
+        return w
+
+    def _local_llm_settings(self) -> dict:
+        """Настройки локальной модели из полей вкладки."""
+        from core.local_llm import DEFAULT_SYSTEM_PROMPT
+        prompt = self.llm_prompt.toPlainText().strip()
+        return {
+            "base_url": self.llm_base_url.text().strip(),
+            "model": self.llm_model.text().strip(),
+            "system_prompt": "" if prompt == DEFAULT_SYSTEM_PROMPT else prompt,
+            "temperature": self.llm_temperature.value(),
+            "top_p": self.llm_top_p.value(),
+            "top_k": self.llm_top_k.value(),
+            "reasoning_effort": self.config["local_llm"].get("reasoning_effort", "none"),
+            "max_tokens": self.config["local_llm"].get("max_tokens", 0),
+            "timeout": float(self.llm_timeout.value()),
+            "use_json_schema": self.llm_json_schema.isChecked(),
+            "repair_retries": 1 if self.llm_repair.isChecked() else 0,
+            "batch_size": self.llm_batch.value(),
+            "context_window": self.llm_context.currentData(),
+            "allow_remote": self.llm_allow_remote.isChecked(),
+        }
+
+    def _local_llm_kwargs(self) -> dict:
+        """Настройки в том виде, в каком их принимает LocalLLMTranslator."""
+        s = self._local_llm_settings()
+        window = s.pop("context_window")
+        # Режим контекста входит в отпечаток кэша: при его смене прежние
+        # переводы больше не годятся.
+        s["context_mode"] = f"event_page_{window}_{window}"
+        return s
+
+    def _local_llm_probe_kwargs(self) -> dict:
+        """То же, но без batch_size — конструктор переводчика его не принимает."""
+        s = self._local_llm_kwargs()
+        s.pop("batch_size", None)
+        return s
+
+    def _save_local_llm(self) -> None:
+        self.config["local_llm"] = self._local_llm_settings()
+        save_config(self.config)
+        self._log("success", "Настройки локальной модели сохранены")
+
+    def _test_local_llm(self) -> None:
+        """Проверка связи в фоне: ожидание может занять секунды."""
+        try:
+            kwargs = self._local_llm_probe_kwargs()
+        except Exception as e:
+            self.llm_test_label.setText(f"✗ {e}")
+            return
+        self.llm_test_btn.setEnabled(False)
+        self.llm_test_label.setText("Проверяю…")
+        self._probe_worker = LocalLLMProbeWorker(kwargs, self)
+        self._probe_worker.done.connect(self._on_local_llm_probe)
+        self._probe_worker.start()
+
+    def _on_local_llm_probe(self, report: dict) -> None:
+        self.llm_test_btn.setEnabled(True)
+        mark = "✓" if report.get("ok") else "✗"
+        self.llm_test_label.setText(f"{mark} {report.get('message', '')}")
+        self._log("success" if report.get("ok") else "error",
+                  f"Локальная модель: {report.get('message', '')}")
+
     # ── Логика ─────────────────────────────────────────────────────────────
 
     def _set_combo_value(self, combo: QComboBox, value: str) -> None:
@@ -1009,7 +1263,25 @@ class MainWindow(QMainWindow):
             pname = combo.currentText()
             api_key = keys.get(pname, "")
             extra: dict = {}
-            if pname in ("DeepL", "Yandex") and not api_key:
+            if pname == LOCAL_LLM:
+                # Локальной модели ключ не нужен; вместо него едут адрес,
+                # модель, инструкция и параметры генерации.
+                try:
+                    extra = self._local_llm_kwargs()
+                except Exception as e:
+                    QMessageBox.warning(self, "Локальная модель", str(e))
+                    return None
+                if not extra["model"]:
+                    if not require_keys:
+                        return None
+                    QMessageBox.warning(
+                        self, "Локальная модель",
+                        "Укажи идентификатор модели на вкладке «Локальная модель».",
+                    )
+                    return None
+                providers.append((pname, "", extra))
+                continue
+            if needs_api_key(pname) and not api_key:
                 if not require_keys:
                     return None      # анализу ключи не нужны, молча выходим
                 QMessageBox.warning(
@@ -1197,6 +1469,7 @@ class MainWindow(QMainWindow):
             route=route,
             stage_providers=providers,
             batch_size=self.batch_spin.value(),
+            item_window=self.llm_context.currentData(),
             group_dialogues=self.group_dialogues_cb.isChecked(),
             test_files=test_files,
             lang_filter=lang_filter,

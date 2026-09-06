@@ -36,6 +36,7 @@ class TranslationWorker(QThread):
         route: TranslationRoute,
         stage_providers: list[tuple],
         batch_size: int = 40,
+        item_window: int = 1,
         group_dialogues: bool = True,
         test_files: list[str] | None = None,
         lang_filter: list[str] | None = None,
@@ -51,6 +52,7 @@ class TranslationWorker(QThread):
         self.route = route
         self.stage_providers = stage_providers
         self.batch_size = batch_size
+        self.item_window = max(0, int(item_window))
         self.group_dialogues = group_dialogues
         # Если задан — переводим только указанные файлы
         self.test_files = set(test_files) if test_files else None
@@ -274,8 +276,13 @@ class TranslationWorker(QThread):
 
         # 3. Группировка
         self.phase.emit("Подготовка пакетов…")
+        # item_window — сколько соседних реплик кладётся в контекст КАЖДОГО
+        # элемента (для провайдеров, принимающих элемент целиком). Считается
+        # только внутри своей сцены; шире — не лучше: на широком контексте
+        # модель чаще теряла управляющие коды.
         units = build_translation_units(
             project.entries, group_dialogues=self.group_dialogues,
+            item_window=self.item_window,
         )
         multi = sum(1 for u in units if len(u.entry_indices) > 1)
         self.log.emit(
@@ -295,9 +302,23 @@ class TranslationWorker(QThread):
         # на весь пакет им не подходит: пакет может собрать реплики из разных
         # сцен, и подсказка от чужой сцены увела бы перевод.
         unit_items_list = None
-        if any(p[0] == LOCAL_LLM for p in self.stage_providers):
+        batch_size = self.batch_size
+        local_stages = [p for p in self.stage_providers if p[0] == LOCAL_LLM]
+        if local_stages:
             from core.local_llm import unit_items
             unit_items_list = unit_items(units, project.glossary)
+            # Размер пакета для локальной модели свой и заметно меньше: она
+            # держит ответ целиком в бюджете токенов, и на большом пакете он
+            # обрывается по лимиту, а вместе с ним рушится весь JSON.
+            extra = local_stages[0][2] if len(local_stages[0]) > 2 else {}
+            local_batch = int(extra.get("batch_size") or 5)
+            if batch_size > local_batch:
+                self.log.emit(
+                    "info",
+                    f"Размер пакета уменьшен до {local_batch}: столько "
+                    "выдерживает локальная модель.",
+                )
+                batch_size = local_batch
 
         # При возобновлении подсчёт «уже переведённых» из кэша
         if is_resume or len(cache) > 0:
@@ -321,7 +342,7 @@ class TranslationWorker(QThread):
             translated_texts = translate_with_chain(
                 unit_texts,
                 cfg,
-                batch_size=self.batch_size,
+                batch_size=batch_size,
                 contexts=unit_contexts,
                 progress_cb=lambda d, t, s: self.progress.emit(d, t, s),
                 should_stop=self._should_stop,
@@ -542,3 +563,27 @@ class KeySearchWorker(QThread):
         except Exception:
             key, managers = None, None
         self.done.emit(key, managers)
+
+
+class LocalLLMProbeWorker(QThread):
+    """Проверка связи с локальной моделью в фоне.
+
+    Первый запрос после загрузки модели занимает секунды, а при выключенном
+    сервере ожидание упирается в таймаут. В GUI-потоке это выглядело бы как
+    зависшее окно.
+    """
+
+    done = pyqtSignal(object)    # dict-отчёт из LocalLLMTranslator.probe()
+
+    def __init__(self, settings: dict, parent=None):
+        super().__init__(parent)
+        self.settings = dict(settings)
+
+    def run(self) -> None:
+        try:
+            from core.local_llm import LocalLLMTranslator
+            report = LocalLLMTranslator(**self.settings).probe()
+        except Exception as e:
+            report = {"ok": False, "reachable": False, "model_found": False,
+                      "responds": False, "message": str(e), "models": []}
+        self.done.emit(report)

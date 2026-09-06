@@ -536,6 +536,10 @@ def needs_api_key(provider: str) -> bool:
 def make_translator(provider: str, api_key: str, **kwargs) -> Translator:
     if provider == LOCAL_LLM:
         from core.local_llm import LocalLLMTranslator
+        kwargs = dict(kwargs)
+        # Размер пакета — свойство прогона, а не переводчика: его выбирает
+        # translate_with_chain, а сюда он приезжает в той же пачке настроек.
+        kwargs.pop("batch_size", None)
         return LocalLLMTranslator(api_key=api_key, **kwargs)
     cls = PROVIDERS.get(provider)
     if not cls:
