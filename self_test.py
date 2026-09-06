@@ -915,6 +915,31 @@ def test_llm_cache_namespace_tracks_settings():
     assert_equal(base.cache_namespace.startswith("local:"), True, "префикс кэша")
 
 
+def test_glossary_change_invalidates_local_llm_cache():
+    """§12: правка глоссария обязана сбросить кэш локальной модели.
+
+    Глоссарий меняет и то, что видит модель, и то, что до неё вообще доходит:
+    закрытые им термины заменяются плейсхолдерами ещё до отправки. Раньше
+    версия глоссария объявлена была, но никто её не заполнял — пользователь
+    правил имя персонажа, запускал заново и получал тот же перевод.
+    """
+    from core.local_llm import LocalLLMTranslator, glossary_fingerprint
+
+    a = Glossary({"Keiko": "Кэйко", "Yutaka": "Ютака"})
+    b = Glossary({"Keiko": "Кейко", "Yutaka": "Ютака"})   # исправили одно имя
+    same = Glossary({"Yutaka": "Ютака", "Keiko": "Кэйко"})  # тот же состав
+
+    assert_equal(glossary_fingerprint(a), glossary_fingerprint(same),
+                 "порядок терминов не должен влиять на версию")
+    if glossary_fingerprint(a) == glossary_fingerprint(b):
+        raise AssertionError("правка термина не меняет версию глоссария")
+
+    ns_a = LocalLLMTranslator(glossary_version=glossary_fingerprint(a)).cache_namespace
+    ns_b = LocalLLMTranslator(glossary_version=glossary_fingerprint(b)).cache_namespace
+    if ns_a == ns_b:
+        raise AssertionError("правка глоссария не сбрасывает кэш")
+
+
 def test_llm_transport_errors_are_explicit():
     """§11: у каждой поломки должно быть внятное состояние, а не «ошибка сети»."""
     from core.local_llm import LocalLLMTranslator
@@ -1138,6 +1163,7 @@ TESTS = [
     test_llm_repairs_single_item_without_touching_the_rest,
     test_llm_failed_item_is_not_cached,
     test_llm_cache_namespace_tracks_settings,
+    test_glossary_change_invalidates_local_llm_cache,
     test_llm_transport_errors_are_explicit,
     test_llm_probe_reports_each_cause_separately,
     test_llm_receives_isolated_per_item_context,

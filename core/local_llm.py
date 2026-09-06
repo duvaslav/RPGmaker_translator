@@ -549,6 +549,17 @@ def items_for_stage(items: list[TranslationItem], texts: list[str]) -> list[Tran
     return [replace(item, text=text) for item, text in zip(items, texts)]
 
 
+def glossary_fingerprint(glossary) -> str:
+    """Версия глоссария для ключа кэша.
+
+    Глоссарий меняет и то, что видит модель, и то, что до неё вообще доходит:
+    закрытые им термины заменяются плейсхолдерами ещё до отправки. Значит, он
+    обязан быть в ключе кэша — иначе пользователь правит имя персонажа,
+    запускает заново и получает ровно тот же перевод.
+    """
+    return fingerprint(terms=dict(getattr(glossary, "terms", {}) or {}))
+
+
 def unit_items(units, glossary=None) -> list[TranslationItem]:
     """Строит элементы контракта из единиц перевода.
 

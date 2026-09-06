@@ -306,8 +306,15 @@ class TranslationWorker(QThread):
         batch_size = self.batch_size
         local_stages = [p for p in self.stage_providers if p[0] == LOCAL_LLM]
         if local_stages:
-            from core.local_llm import unit_items
+            from core.local_llm import glossary_fingerprint, unit_items
             unit_items_list = unit_items(units, project.glossary)
+            # Глоссарий обязан входить в ключ кэша: он меняет и то, что видит
+            # модель, и то, что до неё доходит вообще — закрытые им термины
+            # заменяются плейсхолдерами ещё до отправки.
+            version = glossary_fingerprint(glossary)
+            for stage in self.stage_providers:
+                if stage[0] == LOCAL_LLM and len(stage) > 2 and isinstance(stage[2], dict):
+                    stage[2]["glossary_version"] = version
             # Размер пакета для локальной модели свой и заметно меньше: она
             # держит ответ целиком в бюджете токенов, и на большом пакете он
             # обрывается по лимиту, а вместе с ним рушится весь JSON.
