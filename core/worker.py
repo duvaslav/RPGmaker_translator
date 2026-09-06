@@ -16,7 +16,7 @@ from core.rpgmaker_parser import (
     RPGMakerProject, build_translation_units, split_translated_unit,
 )
 from core.translators import (
-    ChainConfig, TranslationRoute, translate_with_chain, TranslationError,
+    ChainConfig, TranslationRoute, translate_with_chain, TranslationError, LOCAL_LLM,
 )
 
 
@@ -290,6 +290,15 @@ class TranslationWorker(QThread):
         unit_texts = [u.combined_text for u in units]
         unit_contexts = [u.context for u in units]
 
+        # Провайдеры, принимающие элемент целиком (локальная модель), получают
+        # для каждой строки свой контекст и метаданные. Общая строка контекста
+        # на весь пакет им не подходит: пакет может собрать реплики из разных
+        # сцен, и подсказка от чужой сцены увела бы перевод.
+        unit_items_list = None
+        if any(p[0] == LOCAL_LLM for p in self.stage_providers):
+            from core.local_llm import unit_items
+            unit_items_list = unit_items(units, project.glossary)
+
         # При возобновлении подсчёт «уже переведённых» из кэша
         if is_resume or len(cache) > 0:
             # Считаем, сколько unit'ов уже целиком в кэше
@@ -319,6 +328,7 @@ class TranslationWorker(QThread):
                 wait_if_paused=self._wait_if_paused,
                 cache=cache,
                 stats=chain_stats,
+                items=unit_items_list,
             )
         except TranslationError as e:
             translation_error = e

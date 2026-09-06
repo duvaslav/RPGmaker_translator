@@ -64,6 +64,27 @@ DEFAULT_CONFIG = {
     "group_dialogues": True,
     "lang_filter": [],
     "encryption_key": "",
+    # ── Локальная модель ────────────────────────────────────────────────────
+    # Значения по умолчанию взяты из протокола испытаний Qwen3.5-4B Q4_K_M:
+    # профиль 4096 / GPU 0.8 / parallel 1, температура 0, рассуждения выключены.
+    # Пакет 5 — безопасный для 16 ГиБ ОЗУ; 10 быстрее и проверен на 32 ГиБ;
+    # 20 экспериментальный, на нём терялся управляющий код.
+    "local_llm": {
+        "base_url": "http://127.0.0.1:1234/v1",
+        "model": "qwen3.5-4b-rpg-ru-safe",
+        "system_prompt": "",        # пусто = промпт по умолчанию из core.local_llm
+        "temperature": 0.0,
+        "top_p": 0.8,
+        "top_k": 20,
+        "reasoning_effort": "none",
+        "max_tokens": 0,            # 0 = не ограничивать
+        "timeout": 180.0,
+        "use_json_schema": True,
+        "repair_retries": 1,
+        "batch_size": 5,
+        "context_window": 1,        # 1 до и 1 после, в пределах Event/Page
+        "allow_remote": False,
+    },
 }
 
 
@@ -84,6 +105,11 @@ def load_config() -> dict:
     # Гарантируем все провайдеры
     for p in DEFAULT_CONFIG["api_keys"]:
         cfg["api_keys"].setdefault(p, "")
+    # Новые настройки, появившиеся после того как конфиг был записан: без
+    # этого обновление приложения падало бы на отсутствующем ключе.
+    local = dict(DEFAULT_CONFIG["local_llm"])
+    local.update(cfg.get("local_llm") or {})
+    cfg["local_llm"] = local
     return cfg
 
 

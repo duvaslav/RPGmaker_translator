@@ -17,7 +17,7 @@ import json
 import os
 import re
 import tempfile
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from collections import Counter
 from typing import Any
@@ -465,11 +465,58 @@ class TextEntry:
     needs_translation: bool = True  # False = техническая строка, пропускаем переводчик
     block: MessageBlock | None = None   # для сообщений: путь ведёт к списку команд
     raw: str = ""                   # исходный текст до защиты кодов
+    scope: str = ""                 # сцена: файл + Event/Page/список команд
+    text_type: str = "other"        # dialogue | choice | scroll | name | database | system
+    speaker: str = ""               # имя говорящего, если движок его дал явно
 
     @property
     def is_message(self) -> bool:
         """True — запись описывает целое окно сообщения, а не одно значение."""
         return self.block is not None
+
+
+# Явный тег имени говорящего: \N<Эрия>. Именно тег, а не \N[7] — последнее
+# подставляет имя героя по номеру и говорящего не обозначает.
+_SPEAKER_TAG = re.compile(r'\\N<([^>]{1,40})>')
+
+
+def _speaker_from_tag(raw_text: str) -> str:
+    """Имя говорящего, если оно записано явным тегом.
+
+    Имя НЕ угадывается по файлу портрета: один и тот же портрет используют
+    разные персонажи, а ошибочный говорящий хуже отсутствующего — он уводит
+    род и обращение в переводе.
+    """
+    m = _SPEAKER_TAG.search(raw_text or "")
+    return m.group(1).strip() if m else ""
+
+
+def scope_of(file: str, path: tuple) -> str:
+    """Область, дальше которой контекст не должен выходить.
+
+    Соседство в списке entries — это порядок обхода JSON, а не порядок сцен.
+    Реплики соседних событий на одной карте лежат подряд, хотя происходят в
+    разных местах и, возможно, никогда не встречаются в одной игровой сессии.
+    На реальной Map041 фраза Event 4/Page 1 «Let's get along!» получала в
+    качестве «следующего текста» реплики Event 5 и Event 6 — подсказку из
+    чужой сцены.
+
+    Граница берётся из настоящего пути в JSON:
+
+    * список команд события — ``events/4/pages/1/list``, ``12/list``,
+      ``3/pages/0/list``: всё, что до слова ``list`` включительно;
+    * запись базы данных — её индекс в массиве;
+    * остальное (System.json, displayName карты) — файл целиком.
+    """
+    tail: tuple = ()
+    for i in range(len(path) - 1, -1, -1):
+        if path[i] == "list":
+            tail = path[:i + 1]
+            break
+    else:
+        if path and isinstance(path[0], int):
+            tail = path[:1]
+    return file + "|" + "/".join(str(x) for x in tail)
 
 
 # ────────────────────────────────────────────────────────────────────────────
@@ -621,7 +668,8 @@ class RPGMakerProject:
     def _add(self, raw_text: str, file: str, path: tuple,
              group_id: str = "", is_dialogue: bool = False,
              force_technical: bool = False,
-             block: "MessageBlock | None" = None) -> None:
+             block: "MessageBlock | None" = None,
+             text_type: str = "other", speaker: str = "") -> None:
         if not isinstance(raw_text, str) or not raw_text.strip():
             return
         if block is not None and self.measurer is not None:
@@ -662,6 +710,8 @@ class RPGMakerProject:
             text=protected, codes=codes, file=file, path=path,
             group_id=group_id, is_dialogue=is_dialogue,
             needs_translation=needs_translation, block=block, raw=raw_text,
+            scope=scope_of(file, path), text_type=text_type,
+            speaker=speaker or _speaker_from_tag(raw_text),
         ))
 
     def _extract_event_list(self, event_list: list, file: str, base_path: tuple) -> None:
@@ -710,19 +760,23 @@ class RPGMakerProject:
                 if isinstance(choices, list):
                     for j, ch in enumerate(choices):
                         if isinstance(ch, str):
-                            self._add(ch, file, base_path + (i, "parameters", 0, j))
+                            self._add(ch, file, base_path + (i, "parameters", 0, j),
+                                      text_type="choice")
 
             elif code == 402 and isinstance(params, list) and len(params) >= 2:
                 if isinstance(params[1], str):
-                    self._add(params[1], file, base_path + (i, "parameters", 1))
+                    self._add(params[1], file, base_path + (i, "parameters", 1),
+                              text_type="choice")
 
             elif code == 405 and isinstance(params, list) and params:
                 if isinstance(params[0], str):
-                    self._add(params[0], file, base_path + (i, "parameters", 0))
+                    self._add(params[0], file, base_path + (i, "parameters", 0),
+                              text_type="scroll")
 
             elif code == 320 and isinstance(params, list) and len(params) >= 2:
                 if isinstance(params[1], str):
-                    self._add(params[1], file, base_path + (i, "parameters", 1))
+                    self._add(params[1], file, base_path + (i, "parameters", 1),
+                              text_type="name")
 
             i += 1
 
@@ -770,18 +824,25 @@ class RPGMakerProject:
         raw = "\n".join(lines)
 
         # Заголовок 101 у MZ несёт имя говорящего в params[4] — его переводим
-        # отдельной записью, окна оно не касается.
+        # отдельной записью, окна оно не касается. Оно же — единственный
+        # достоверный источник говорящего для контекста: портрет им не является.
+        speaker = ""
         if block.header_index is not None:
-            self._add_speaker_name(event_list[block.header_index], file,
-                                   base_path, block.header_index)
+            speaker = self._add_speaker_name(event_list[block.header_index], file,
+                                             base_path, block.header_index)
 
-        self._add(raw, file, base_path, is_dialogue=True, block=block)
+        self._add(raw, file, base_path, is_dialogue=True, block=block,
+                  text_type="dialogue", speaker=speaker)
 
     def _add_speaker_name(self, cmd: dict, file: str, base_path: tuple,
-                          index: int) -> None:
+                          index: int) -> str:
+        """Добавляет имя говорящего из MZ-заголовка. Возвращает само имя."""
         params = cmd.get("parameters") or []
         if len(params) >= 5 and isinstance(params[4], str) and params[4].strip():
-            self._add(params[4], file, base_path + (index, "parameters", 4))
+            self._add(params[4], file, base_path + (index, "parameters", 4),
+                      text_type="name")
+            return params[4].strip()
+        return ""
 
     def _extract_map_events(self, file: str) -> None:
         data = self._read(file)
@@ -790,7 +851,7 @@ class RPGMakerProject:
         # Имя карты (display name) лежит в самом файле как displayName
         dn = data.get("displayName")
         if isinstance(dn, str) and dn.strip():
-            self._add(dn, file, ("displayName",))
+            self._add(dn, file, ("displayName",), text_type="name")
         # note карты часто содержит плагин-теги — не трогаем по умолчанию
 
         events = data.get("events") or []
@@ -856,6 +917,7 @@ class RPGMakerProject:
                 if isinstance(val, str) and val.strip():
                     self._add(
                         val, file, (i, field_name),
+                        text_type="database",
                         force_technical=(
                             editor_only
                             or (field_name == "name"
@@ -957,14 +1019,14 @@ class RPGMakerProject:
         for f in SYSTEM_STRING_FIELDS:
             val = data.get(f)
             if isinstance(val, str) and val.strip():
-                self._add(val, file, (f,))
+                self._add(val, file, (f,), text_type="system")
 
         for f in SYSTEM_LIST_FIELDS:
             arr = data.get(f)
             if isinstance(arr, list):
                 for i, v in enumerate(arr):
                     if isinstance(v, str) and v.strip():
-                        self._add(v, file, (f, i))
+                        self._add(v, file, (f, i), text_type="system")
 
         terms = data.get("terms")
         if isinstance(terms, dict):
@@ -973,12 +1035,12 @@ class RPGMakerProject:
                 if isinstance(arr, list):
                     for i, v in enumerate(arr):
                         if isinstance(v, str) and v.strip():
-                            self._add(v, file, ("terms", tl, i))
+                            self._add(v, file, ("terms", tl, i), text_type="system")
             messages = terms.get("messages")
             if isinstance(messages, dict):
                 for key, val in messages.items():
                     if isinstance(val, str) and val.strip():
-                        self._add(val, file, ("terms", "messages", key))
+                        self._add(val, file, ("terms", "messages", key), text_type="system")
 
     def _extract_i18n_texts(self) -> None:
         """Извлекает строки из I18NTexts.json — плагина мультиязычности.
@@ -1259,6 +1321,16 @@ class TranslationUnit:
     separator: str             # разделитель, использованный при склейке
     context: str = ""          # соседние реплики/сцена: подсказка для API, не переводится
     tagged: bool = False       # части обёрнуты в HTML-теги с устойчивыми границами
+    # ── Поля для провайдеров, принимающих элемент целиком ───────────────────
+    # Облачные сервисы берут одну строку context на весь пакет; языковая модель
+    # получает контекст ОТДЕЛЬНО для каждого элемента, иначе соседний элемент
+    # из другой сцены становится подсказкой.
+    item_id: str = ""              # устойчивый идентификатор: путь в JSON
+    text_type: str = "other"
+    speaker: str = ""
+    context_before: list[str] = field(default_factory=list)
+    context_after: list[str] = field(default_factory=list)
+    location: dict = field(default_factory=dict)
 
 
 # Обычный перенос строки внутри сообщения. Раньше использовался видимый
@@ -1274,7 +1346,8 @@ def _wrap_group_part(index: int, text: str) -> str:
 
 
 def build_translation_units(entries: list[TextEntry],
-                            group_dialogues: bool = True) -> list[TranslationUnit]:
+                            group_dialogues: bool = True,
+                            item_window: int = 1) -> list[TranslationUnit]:
     """
     Превращает entries в units для перевода.
     Технические entries (needs_translation=False) пропускаются — они не идут переводчику.
@@ -1316,6 +1389,7 @@ def build_translation_units(entries: list[TextEntry],
                 separator=JOIN_SEP,
                 context=_build_unit_context(entries, i, j),
                 tagged=True,
+                **_unit_meta(entries, i, j, item_window),
             ))
             i = j
         else:
@@ -1324,9 +1398,53 @@ def build_translation_units(entries: list[TextEntry],
                 combined_text=e.text,
                 separator=JOIN_SEP,
                 context=_build_unit_context(entries, i, i + 1),
+                **_unit_meta(entries, i, i + 1, item_window),
             ))
             i += 1
     return units
+
+
+def _unit_meta(entries: list[TextEntry], start: int, end: int,
+               window: int) -> dict:
+    """Метаданные единицы: идентификатор, тип, говорящий, контекст, место."""
+    e = entries[start]
+    before, _current, after = context_lines(entries, start, end, window)
+    return {
+        "item_id": item_id_for(e),
+        "text_type": e.text_type,
+        "speaker": e.speaker,
+        "context_before": before,
+        "context_after": after,
+        "location": location_of(e),
+    }
+
+
+def item_id_for(entry: TextEntry) -> str:
+    """Идентификатор элемента: файл и путь в JSON.
+
+    Берётся из настоящего положения в исходнике, а не из номера в пакете:
+    номер меняется от запуска к запуску, путь — нет. Это позволяет
+    сопоставлять ответ модели по идентификатору, а не по позиции.
+    """
+    return entry.file + ":" + "/".join(str(x) for x in entry.path)
+
+
+def location_of(entry: TextEntry) -> dict:
+    """Место реплики в понятиях редактора: карта, событие, страница."""
+    loc: dict = {"file": entry.file}
+    path = entry.path
+    for key, label in (("events", "event"), ("pages", "page")):
+        try:
+            idx = path.index(key)
+        except ValueError:
+            continue
+        if idx + 1 < len(path):
+            loc[label] = path[idx + 1]
+    if entry.file == "CommonEvents.json" and path and isinstance(path[0], int):
+        loc["common_event"] = path[0]
+    if entry.file == "Troops.json" and path and isinstance(path[0], int):
+        loc["troop"] = path[0]
+    return loc
 
 
 def split_translated_unit(unit: TranslationUnit, translated: str) -> dict[int, str]:
@@ -1379,12 +1497,23 @@ def _split_tagged_translation(translated: str, target_count: int) -> list[str]:
     return [found[i] for i in range(target_count)]
 
 
-def _build_unit_context(entries: list[TextEntry], start: int, end: int,
-                        window: int = 3, limit: int = 1200) -> str:
-    """Создаёт компактный контекст вокруг unit без изменения переводимого текста."""
-    if not entries:
-        return ""
-    file = entries[start].file if 0 <= start < len(entries) else ""
+def context_lines(entries: list[TextEntry], start: int, end: int,
+                  window: int = 3) -> tuple[list[str], list[str], list[str]]:
+    """Соседние реплики В ПРЕДЕЛАХ ОДНОЙ СЦЕНЫ: (до, текущее, после).
+
+    Ограничение по scope — не украшение, а условие правильности. Записи лежат
+    в порядке обхода JSON, поэтому за последней репликой одного события сразу
+    идёт первая реплика следующего. Без границы фраза из Event 4 получала в
+    качестве продолжения текст Event 5 и Event 6 — сцену, которая в игре может
+    вообще не случиться рядом. Модель и DeepL честно учитывали эту подсказку и
+    уводили перевод в сторону.
+
+    Граница действует для всех провайдеров: контекст из чужой сцены вреден
+    любому переводчику, а не только языковой модели.
+    """
+    if not entries or not (0 <= start < len(entries)):
+        return [], [], []
+    scope = entries[start].scope
 
     def readable(e: TextEntry) -> str:
         text = clean_for_detection(e.text)
@@ -1394,7 +1523,7 @@ def _build_unit_context(entries: list[TextEntry], start: int, end: int,
     i = start - 1
     while i >= 0 and len(prev_lines) < window:
         e = entries[i]
-        if e.file != file:
+        if e.scope != scope:
             break
         text = readable(e)
         if text:
@@ -1409,12 +1538,23 @@ def _build_unit_context(entries: list[TextEntry], start: int, end: int,
     i = end
     while i < len(entries) and len(next_lines) < window:
         e = entries[i]
-        if e.file != file:
+        if e.scope != scope:
             break
         text = readable(e)
         if text:
             next_lines.append(text)
         i += 1
+
+    return prev_lines, current_lines, next_lines
+
+
+def _build_unit_context(entries: list[TextEntry], start: int, end: int,
+                        window: int = 3, limit: int = 1200) -> str:
+    """Создаёт компактный контекст вокруг unit без изменения переводимого текста."""
+    if not entries:
+        return ""
+    file = entries[start].file if 0 <= start < len(entries) else ""
+    prev_lines, current_lines, next_lines = context_lines(entries, start, end, window)
 
     chunks = [f"RPG Maker scene/file: {file}"]
     if prev_lines:

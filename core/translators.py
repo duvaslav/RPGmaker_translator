@@ -518,8 +518,25 @@ PROVIDERS: dict[str, type[Translator]] = {
     "Yandex": YandexTranslator,
 }
 
+# Локальная модель. Класс подгружается лениво: core.local_llm импортирует
+# отсюда Translator, и жёсткая ссылка в обратную сторону дала бы цикл.
+LOCAL_LLM = "Local LLM (OpenAI-compatible)"
+
+
+def provider_names() -> list[str]:
+    """Список провайдеров для интерфейса, в порядке показа."""
+    return list(PROVIDERS) + [LOCAL_LLM]
+
+
+def needs_api_key(provider: str) -> bool:
+    """Нужен ли провайдеру ключ. Локальной модели — нет."""
+    return provider in ("DeepL", "Yandex")
+
 
 def make_translator(provider: str, api_key: str, **kwargs) -> Translator:
+    if provider == LOCAL_LLM:
+        from core.local_llm import LocalLLMTranslator
+        return LocalLLMTranslator(api_key=api_key, **kwargs)
     cls = PROVIDERS.get(provider)
     if not cls:
         raise TranslationError(f"Неизвестный провайдер: {provider}")
@@ -584,6 +601,7 @@ def translate_with_chain(
     cache: "TranslationCache | None" = None,
     save_cache_every: int = 1,
     stats: dict | None = None,
+    items: list | None = None,
 ) -> list[str]:
     """
     Прогоняет тексты через все стадии цепочки.
@@ -601,6 +619,12 @@ def translate_with_chain(
     cfg.validate()
     current = list(texts)
     current_contexts = list(contexts) if contexts is not None else [""] * len(current)
+    # items — по элементу на каждый текст, с собственным контекстом и
+    # метаданными. Их принимают провайдеры с wants_items (языковая модель);
+    # облачные сервисы работают по-прежнему со строками и общим контекстом.
+    current_items = list(items) if items is not None else None
+    if current_items is not None and len(current_items) != len(current):
+        raise ValueError("items должен быть той же длины, что и texts")
     stages = cfg.route.stages()
     rejected = 0
     stage_count = len(stages)
@@ -610,7 +634,14 @@ def translate_with_chain(
         translator = make_translator(provider_name, api_key, **extra_kwargs)
         # Кэш привязывается к провайдеру ИМЕННО ЭТОЙ стадии: в цепочке
         # JP→EN Google, EN→RU DeepL это два независимых набора переводов.
-        stage_cache = cache.for_provider(provider_name) if cache is not None else None
+        # Пространство имён кэша спрашиваем у самого переводчика: локальная
+        # модель добавляет в него отпечаток модели, промпта и параметров
+        # генерации, потому что при их смене прежний перевод — это ответ на
+        # другой вопрос. Облачные провайдеры возвращают своё имя, и их ключи
+        # остаются прежними.
+        namespace = getattr(translator, "cache_namespace", provider_name)
+        stage_cache = cache.for_provider(namespace) if cache is not None else None
+        wants_items = bool(getattr(translator, "wants_items", False)) and current_items
         stage_label = f"{src.upper()}→{dst.upper()} ({provider_name})"
         total = len(current)
         done = 0
@@ -656,12 +687,26 @@ def translate_with_chain(
                 api_context = _merge_contexts(
                     [batch_contexts[k] for k in to_translate_idx]
                 )
+                if wants_items:
+                    from dataclasses import replace as _replace
+                    # На второй стадии цепочки переводится результат первой,
+                    # поэтому текст в элементе подменяется; метаданные и
+                    # контекст остаются от исходной записи.
+                    api_items = [
+                        _replace(current_items[i + k], text=batch[k])
+                        for k in to_translate_idx
+                    ]
                 attempts = 0
                 while True:
                     try:
-                        api_results = translator.translate_batch(
-                            api_texts, src, dst, context=api_context
-                        )
+                        if wants_items:
+                            api_results = translator.translate_items(
+                                api_items, src, dst, should_stop=should_stop
+                            )
+                        else:
+                            api_results = translator.translate_batch(
+                                api_texts, src, dst, context=api_context
+                            )
                         break
                     except TranslationError as e:
                         attempts += 1
@@ -685,7 +730,13 @@ def translate_with_chain(
                 # валидацию и уже никогда не переводилась заново.
                 good_pairs: list[tuple[str, str]] = []
                 for kk, source_text, val in zip(to_translate_idx, api_texts, api_results):
-                    if _placeholders_intact(source_text, val):
+                    if not val.strip():
+                        # Провайдер не смог перевести строку. Записать пустоту в
+                        # кэш нельзя: следующий запуск взял бы её как готовый
+                        # перевод и строка осталась бы непереведённой навсегда.
+                        cached_results[kk] = ""
+                        rejected += 1
+                    elif _placeholders_intact(source_text, val):
                         cached_results[kk] = val
                         good_pairs.append((source_text, val))
                     else:

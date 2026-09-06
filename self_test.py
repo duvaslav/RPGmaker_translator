@@ -31,7 +31,7 @@ from core.text_fit import (
     wrap_paragraph,
 )
 from core.text_layout import install_runtime_text_wrap
-from core.translators import _keep_entities, _placeholders_intact
+from core.translators import LOCAL_LLM, _keep_entities, _placeholders_intact
 
 
 def assert_equal(actual, expected, label: str) -> None:
@@ -634,6 +634,403 @@ def test_runtime_text_wrap_installer() -> None:
         )
 
 
+# ────────────────────────────────────────────────────────────────────────────
+# Локальная модель: контракт, валидатор и поведение на реальных отказах
+# ────────────────────────────────────────────────────────────────────────────
+
+class MockLLMServer:
+    """Локальный OpenAI-совместимый сервер со сценарием ответов.
+
+    Настоящую модель в тестах использовать нельзя: она вне репозитория, весит
+    2.7 ГБ и на одинаковый запрос отвечает одинаково — то есть воспроизвести
+    на ней ошибочный ответ по требованию невозможно. Мок отдаёт заранее
+    записанные ответы из протокола испытаний, включая испорченные.
+    """
+
+    def __init__(self, script, models=("qwen3.5-4b-rpg-ru-safe",)):
+        import http.server
+        import threading
+
+        self.script = list(script)     # список ответов; последний повторяется
+        self.models = list(models)
+        self.requests: list[dict] = []
+        outer = self
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *a):        # тишина в отчёте теста
+                pass
+
+            def _send(self, payload, status=200):
+                body = json.dumps(payload).encode("utf-8")
+                self.send_response(status)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def do_GET(self):
+                if self.path.endswith("/models"):
+                    self._send({"data": [{"id": m} for m in outer.models]})
+                else:
+                    self._send({"error": "not found"}, 404)
+
+            def do_POST(self):
+                length = int(self.headers.get("Content-Length", 0))
+                body = json.loads(self.rfile.read(length) or b"{}")
+                outer.requests.append(body)
+                idx = min(len(outer.requests) - 1, len(outer.script) - 1)
+                entry = outer.script[idx]
+                if callable(entry):
+                    entry = entry(body)
+                if isinstance(entry, tuple):        # (status, payload)
+                    self._send(entry[1], entry[0])
+                    return
+                self._send({
+                    "choices": [{
+                        "message": {"role": "assistant", "content": entry},
+                        "finish_reason": "stop",
+                    }]
+                })
+
+        self._server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.port = self._server.server_address[1]
+        self.base_url = f"http://127.0.0.1:{self.port}/v1"
+        self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
+
+    def __enter__(self):
+        self._thread.start()
+        return self
+
+    def __exit__(self, *exc):
+        self._server.shutdown()
+        self._server.server_close()
+        return False
+
+
+def _reply(pairs) -> str:
+    return json.dumps({"translations": [{"id": i, "translation": t} for i, t in pairs]},
+                      ensure_ascii=False)
+
+
+def test_llm_validator_catches_documented_failures():
+    """F-001/F-003/F-004: подтверждённые отказы модели обязаны отклоняться.
+
+    Все три взяты из протокола испытаний дословно. Каждый из них проходит
+    какую-нибудь одну проверку — поэтому проверок несколько.
+    """
+    from core.llm_contract import verify
+
+    # F-001: маркер \\N<...> просто исчез. Восстановить код будет нечем.
+    v = verify("real-004", "<t0/>Need something?", "Нужно что-то?")
+    assert_equal(v.ok, False, "F-001 принят")
+
+    # F-003: код валюты переехал перед суммой — «¥700» вместо «700¥».
+    # Количество маркеров и чисел при этом не изменилось, поэтому наивная
+    # проверка «все ли маркеры на месте» такой ответ пропускает.
+    v = verify("real-001", "You obtained 700<t0/>!", "Вы получили<t0/>700!")
+    assert_equal(v.ok, False, "F-003 принят")
+    assert_equal(verify("real-001", "You obtained 700<t0/>!",
+                        "Вы получили 700<t0/>!").ok, True, "верный порядок отклонён")
+
+    # F-004: сумма пропала, маркер уцелел.
+    v = verify("real-014", "You obtained 4000<t0/>!", "Вы получили<t0/>!")
+    assert_equal(v.ok, False, "F-004 принят")
+
+    # Негативные находки протокола: заборов Markdown и преамбул не было, но
+    # проверять их всё равно надо — это условие приёмки, а не наблюдение.
+    assert_equal(verify("x", "Hi", "```\nПривет\n```").ok, False, "Markdown принят")
+    assert_equal(verify("x", "Hi", "Перевод: Привет").ok, False, "преамбула принята")
+    assert_equal(verify("x", "Save", "Save").ok, False, "непереведённое принято")
+    assert_equal(verify("x", "Good morning!", "Доброе утро!").ok, True, "хороший отклонён")
+
+
+def test_llm_response_parsing_rejects_broken_batches():
+    """F-009: без схемы модель ломала JSON — разбор обязан это ловить."""
+    from core.llm_contract import ResponseError, parse_response, response_schema
+
+    ids = ["a", "b"]
+    assert_equal(parse_response(_reply([("a", "А"), ("b", "Б")]), ids),
+                 {"a": "А", "b": "Б"}, "корректный ответ не разобран")
+
+    broken = [
+        '{"translations":[{"id":"a","translation":"А"},',        # обрыв (batch 5)
+        '{"id":"a","id":"b"}',                                   # повтор ключей (batch 10)
+        _reply([("a", "А"), ("a", "Б")]),                        # дубликат id
+        _reply([("a", "А")]),                                    # потерян элемент
+        _reply([("a", "А"), ("c", "В")]),                        # чужой id
+        "",                                                      # пусто
+    ]
+    for payload in broken:
+        try:
+            parse_response(payload, ids)
+        except ResponseError:
+            continue
+        raise AssertionError(f"битый ответ принят: {payload[:40]!r}")
+
+    # Схема должна запрещать и лишние, и недостающие элементы.
+    schema = response_schema(ids)["json_schema"]["schema"]
+    arr = schema["properties"]["translations"]
+    assert_equal((arr["minItems"], arr["maxItems"]), (2, 2), "длина массива не закреплена")
+    assert_equal(arr["items"]["properties"]["id"]["enum"], ids, "id не ограничены списком")
+    assert_equal(arr["items"]["additionalProperties"], False, "разрешены лишние поля")
+
+
+def test_llm_repairs_single_item_without_touching_the_rest():
+    """F-010/F-011: один испорченный элемент чинится в одиночку.
+
+    Пакет из трёх: второй приходит с потерянным маркером. Ремонт должен быть
+    ровно один, ровно по этому элементу и с ДРУГОЙ инструкцией — повторять тот
+    же запрос бесполезно, при температуре 0 модель трижды из трёх повторяла
+    один и тот же дефект.
+    """
+    from core.local_llm import LocalLLMTranslator, REPAIR_PROMPT
+    from core.llm_contract import TranslationItem
+
+    items = [
+        TranslationItem(id="i1", text="Good morning!"),
+        TranslationItem(id="i2", text="<t0/>Need something?"),
+        TranslationItem(id="i3", text="You obtained 700<t1/>!"),
+    ]
+    script = [
+        _reply([("i1", "Доброе утро!"),
+                ("i2", "Нужно что-то?"),               # F-001: маркер потерян
+                ("i3", "Вы получили 700<t1/>!")]),
+        _reply([("i2", "<t0/>Нужно что-то?")]),         # ремонт удался
+    ]
+    with MockLLMServer(script) as server:
+        tr = LocalLLMTranslator(base_url=server.base_url)
+        out = tr.translate_items(items, "en", "ru")
+
+    assert_equal(out, ["Доброе утро!", "<t0/>Нужно что-то?", "Вы получили 700<t1/>!"],
+                 "результат пакета")
+    assert_equal(len(server.requests), 2, "число запросов")
+    repair = server.requests[1]
+    assert_equal(repair["messages"][0]["content"], REPAIR_PROMPT, "инструкция ремонта")
+    repair_items = json.loads(repair["messages"][1]["content"])["items"]
+    assert_equal([i["id"] for i in repair_items], ["i2"], "ремонт не изолирован")
+    assert_equal("context_before" in repair_items[0], False, "в ремонте остался контекст")
+    assert_equal(tr.stats["repaired"], 1, "счётчик починенных")
+    assert_equal(tr.stats["failed"], 0, "счётчик отказов")
+
+
+def test_llm_failed_item_is_not_cached():
+    """§12: неисправимый элемент не попадает ни в кэш, ни в игру.
+
+    Это защита от отравления кэша: если записать испорченный или пустой
+    перевод, следующий запуск возьмёт его как готовый и строка останется
+    сломанной навсегда.
+    """
+    from core.cache import TranslationCache
+    from core.llm_contract import TranslationItem
+    from core.local_llm import LocalLLMTranslator
+    from core.translators import ChainConfig, TranslationRoute, translate_with_chain
+
+    # Во второй строке НЕТ управляющих кодов — и это принципиально. Проверка
+    # плейсхолдеров такую строку пропускает («кодов не было, терять нечего»),
+    # поэтому пустой результат раньше уходил в кэш как готовый перевод.
+    # Здесь модель возвращает исходный английский: перевода не произошло.
+    texts = ["Good morning!", "Need something?"]
+    items = [TranslationItem(id="i1", text=texts[0]),
+             TranslationItem(id="i2", text=texts[1])]
+    # Первый ответ ломает второй элемент, ремонт ломает его же ещё раз.
+    script = [
+        _reply([("i1", "Доброе утро!"), ("i2", "Need something?")]),
+        _reply([("i2", "Need something?")]),
+    ]
+    with tempfile.TemporaryDirectory() as tmp:
+        cache_path = Path(tmp) / "_translation_cache.json"
+        with MockLLMServer(script) as server:
+            cfg = ChainConfig(
+                route=TranslationRoute(src="en", pivot=None, dst="ru"),
+                stage_providers=[(LOCAL_LLM, "", {"base_url": server.base_url})],
+            )
+            cache = TranslationCache(cache_path)
+            out = translate_with_chain(texts, cfg, batch_size=5, cache=cache,
+                                       items=items, stats={})
+        assert_equal(out[0], "Доброе утро!", "исправный элемент")
+        assert_equal(out[1], "", "испорченный элемент должен остаться пустым")
+
+        saved = json.loads(cache_path.read_text(encoding="utf-8"))["entries"]
+        values = list(saved.values())
+        assert_equal(values, ["Доброе утро!"], "в кэш попало лишнее")
+        assert_equal(any(texts[1] in k for k in saved), False,
+                     "для непереведённой строки создана запись кэша")
+
+
+def test_llm_cache_namespace_tracks_settings():
+    """§12: смена модели, промпта или параметров обязана промахнуться мимо кэша.
+
+    Иначе пользователь меняет промпт, запускает заново и получает ровно тот же
+    перевод, не понимая почему.
+    """
+    from core.local_llm import LocalLLMTranslator
+
+    base = LocalLLMTranslator()
+    same = LocalLLMTranslator()
+    assert_equal(base.cache_namespace, same.cache_namespace, "одинаковые настройки")
+
+    for label, kwargs in [
+        ("модель", {"model": "other-model"}),
+        ("промпт", {"system_prompt": "Translate."}),
+        ("температура", {"temperature": 0.7}),
+        ("схема", {"use_json_schema": False}),
+        ("контекст", {"context_mode": "event_page_3_3"}),
+        ("глоссарий", {"glossary_version": "v2"}),
+    ]:
+        other = LocalLLMTranslator(**kwargs)
+        if other.cache_namespace == base.cache_namespace:
+            raise AssertionError(f"{label} не влияет на ключ кэша")
+
+    # Облачные провайдеры остаются в своём пространстве имён.
+    assert_equal(base.cache_namespace.startswith("local:"), True, "префикс кэша")
+
+
+def test_llm_transport_errors_are_explicit():
+    """§11: у каждой поломки должно быть внятное состояние, а не «ошибка сети»."""
+    from core.local_llm import LocalLLMTranslator
+    from core.llm_contract import TranslationItem
+    from core.translators import TranslationError
+
+    items = [TranslationItem(id="i1", text="Hi")]
+
+    # Обрезанный ответ: finish_reason=length. Лечится уменьшением пакета,
+    # поэтому сообщение обязано говорить именно это.
+    truncated = [(200, {"choices": [{"message": {"content": '{"translations":['},
+                                    "finish_reason": "length"}]})]
+    with MockLLMServer(truncated) as server:
+        tr = LocalLLMTranslator(base_url=server.base_url)
+        try:
+            tr.translate_items(items, "en", "ru")
+            raise AssertionError("обрезанный ответ принят")
+        except TranslationError as e:
+            assert_equal("Уменьшите размер пакета" in str(e), True, f"текст ошибки: {e}")
+
+    # Сервера нет вообще.
+    tr = LocalLLMTranslator(base_url="http://127.0.0.1:1/v1")
+    try:
+        tr.translate_items(items, "en", "ru")
+        raise AssertionError("отсутствие сервера не замечено")
+    except TranslationError as e:
+        assert_equal("не отвечает" in str(e), True, f"текст ошибки: {e}")
+        assert_equal(e.recoverable, False, "повторять запросы к мёртвому серверу")
+
+    # Нелокальный адрес: в запросах едет текст игры, наружу его выпускать нельзя.
+    try:
+        LocalLLMTranslator(base_url="http://10.0.0.5:1234/v1")
+        raise AssertionError("нелокальный адрес принят молча")
+    except TranslationError as e:
+        assert_equal("локальным" in str(e), True, f"текст ошибки: {e}")
+
+
+def test_llm_probe_reports_each_cause_separately():
+    """§14: «проверить соединение» отвечает, ЧТО именно не так — лечится разным."""
+    from core.local_llm import LocalLLMTranslator
+
+    ok_script = [_reply([("probe-1", "Доброе утро!")])]
+
+    # Сервер работает, модель загружена, формат соблюдён.
+    with MockLLMServer(ok_script) as server:
+        report = LocalLLMTranslator(base_url=server.base_url).probe()
+    assert_equal(report["ok"], True, f"исправная связка: {report['message']}")
+    assert_equal(report["model_found"], True, "модель не найдена")
+
+    # Сервер работает, но загружена другая сборка. Похожее имя не годится:
+    # другая сборка даст другой перевод и другой кэш.
+    with MockLLMServer(ok_script, models=("qwen3.5-4b",)) as server:
+        report = LocalLLMTranslator(base_url=server.base_url).probe()
+    assert_equal(report["reachable"], True, "сервер не увиден")
+    assert_equal(report["model_found"], False, "чужая модель зачтена")
+    assert_equal(report["ok"], False, "проверка пройдена с чужой моделью")
+
+    # Модель есть, но отвечает не по контракту.
+    with MockLLMServer(["Конечно! Вот перевод: Доброе утро!"]) as server:
+        report = LocalLLMTranslator(base_url=server.base_url).probe()
+    assert_equal(report["model_found"], True, "модель не найдена")
+    assert_equal(report["responds"], False, "болтовня зачтена за контракт")
+
+    # Сервера нет.
+    report = LocalLLMTranslator(base_url="http://127.0.0.1:1/v1").probe(timeout=2)
+    assert_equal(report["reachable"], False, "мёртвый сервер зачтён живым")
+
+
+def test_llm_receives_isolated_per_item_context():
+    """§6: контекст элемента не выходит за пределы своей сцены.
+
+    Регрессия на задокументированный случай: на реальной Map041 фраза
+    Event 4 / Page 1 «Let's get along!» получала «следующим текстом» реплики
+    Event 5 и Event 6 — сцену, которая в игре рядом может не случиться.
+    """
+    from core.local_llm import LocalLLMTranslator, unit_items
+    from core.llm_contract import TranslationItem
+
+    entries = [
+        TextEntry(text="Let's get along!", codes=[], file="Map041.json",
+                  path=("events", 4, "pages", 1, "list", 1, "parameters", 0),
+                  scope="Map041.json|events/4/pages/1/list", text_type="dialogue"),
+        TextEntry(text="You obtained 700<t0/>!", codes=[], file="Map041.json",
+                  path=("events", 5, "pages", 0, "list", 2, "parameters", 0),
+                  scope="Map041.json|events/5/pages/0/list", text_type="dialogue"),
+        TextEntry(text="What's that supposed to mean!?", codes=[], file="Map041.json",
+                  path=("events", 6, "pages", 0, "list", 1, "parameters", 0),
+                  scope="Map041.json|events/6/pages/0/list", text_type="dialogue"),
+    ]
+    units = build_translation_units(entries, group_dialogues=False)
+    items = unit_items(units)
+
+    assert_equal(items[0].context_after, [], "контекст перетёк из чужого Event")
+    assert_equal(items[0].context_before, [], "контекст перетёк из чужого Event")
+    assert_equal(items[0].id, "Map041.json:events/4/pages/1/list/1/parameters/0",
+                 "идентификатор элемента")
+    assert_equal(items[0].location, {"file": "Map041.json", "event": 4, "page": 1},
+                 "место элемента")
+
+    # Внутри одной сцены контекст, наоборот, обязан быть.
+    same_scene = [
+        TextEntry(text="Line one.", codes=[], file="Map001.json",
+                  path=("events", 1, "pages", 0, "list", 1, "parameters", 0),
+                  scope="Map001.json|events/1/pages/0/list", text_type="dialogue"),
+        TextEntry(text="Line two.", codes=[], file="Map001.json",
+                  path=("events", 1, "pages", 0, "list", 2, "parameters", 0),
+                  scope="Map001.json|events/1/pages/0/list", text_type="dialogue"),
+    ]
+    items = unit_items(build_translation_units(same_scene, group_dialogues=False))
+    assert_equal(items[0].context_after, ["Line two."], "контекст сцены потерян")
+    assert_equal(items[1].context_before, ["Line one."], "контекст сцены потерян")
+
+    # И этот контекст должен реально доехать до модели — отдельно у каждого
+    # элемента, а не общей строкой на весь пакет.
+    with MockLLMServer([_reply([(items[0].id, "Строка один."),
+                                (items[1].id, "Строка два.")])]) as server:
+        LocalLLMTranslator(base_url=server.base_url).translate_items(items, "en", "ru")
+        sent = json.loads(server.requests[0]["messages"][1]["content"])["items"]
+    assert_equal(sent[0]["context_after"], ["Line two."], "контекст не отправлен")
+    assert_equal(sent[1]["context_before"], ["Line one."], "контекст не отправлен")
+
+
+def test_llm_request_shape_follows_the_protocol():
+    """§16: параметры запроса — те, что признаны безопасными в испытаниях."""
+    from core.local_llm import LocalLLMTranslator, DEFAULT_SYSTEM_PROMPT
+    from core.llm_contract import TranslationItem
+
+    items = [TranslationItem(id="i1", text="Good morning!")]
+    with MockLLMServer([_reply([("i1", "Доброе утро!")])]) as server:
+        LocalLLMTranslator(base_url=server.base_url).translate_items(items, "en", "ru")
+        body = server.requests[0]
+
+    assert_equal(body["stream"], False, "включён поток")
+    assert_equal(body["temperature"], 0.0, "температура")
+    assert_equal(body["top_p"], 0.8, "top_p")
+    assert_equal(body["top_k"], 20, "top_k")
+    assert_equal(body["reasoning_effort"], "none", "рассуждения не выключены")
+    assert_equal(body["messages"][0]["content"], DEFAULT_SYSTEM_PROMPT, "промпт по умолчанию")
+    # Строгая схема обязательна на любом размере пакета: без неё корректный
+    # JSON приходил в 13 случаях из 15, а точные идентификаторы — в 11.
+    assert_equal(body["response_format"]["json_schema"]["strict"], True, "схема не строгая")
+    assert_equal(body["response_format"]["json_schema"]["schema"]["properties"]
+                 ["translations"]["items"]["properties"]["id"]["enum"], ["i1"],
+                 "идентификаторы не закреплены схемой")
+
+
 TESTS = [
     test_code_roundtrip,
     test_duplicate_placeholder_is_dropped,
@@ -662,6 +1059,16 @@ TESTS = [
     test_map_tree_labels_are_not_translated,
     test_output_dir_guard,
     test_runtime_text_wrap_installer,
+    # ── Локальная модель ────────────────────────────────────────────────────
+    test_llm_validator_catches_documented_failures,
+    test_llm_response_parsing_rejects_broken_batches,
+    test_llm_repairs_single_item_without_touching_the_rest,
+    test_llm_failed_item_is_not_cached,
+    test_llm_cache_namespace_tracks_settings,
+    test_llm_transport_errors_are_explicit,
+    test_llm_probe_reports_each_cause_separately,
+    test_llm_receives_isolated_per_item_context,
+    test_llm_request_shape_follows_the_protocol,
 ]
 
 
