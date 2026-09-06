@@ -82,6 +82,29 @@ _LANG_NAMES = {
 }
 
 
+# Порог свободной оперативной памяти. Модель на 4 ГБ занимает при работе
+# около 12.7 ГиБ приватной памяти; на машине с 16 ГиБ запас тает быстро, а
+# когда система уходит в подкачку, зависает не только перевод, но и рабочий
+# стол. Лучше остановиться на границе пакета, чем добить машину.
+MIN_FREE_RAM_MB = 1536
+
+
+def available_ram_mb() -> float | None:
+    """Свободная физическая память в МиБ. None — измерить нечем.
+
+    psutil ставится опционально: без него сторож просто молчит, а не мешает
+    работать. Подменять его чтением /proc нельзя — целевая система Windows.
+    """
+    try:
+        import psutil
+    except ImportError:
+        return None
+    try:
+        return psutil.virtual_memory().available / (1024 * 1024)
+    except Exception:
+        return None
+
+
 def _is_loopback(base_url: str) -> bool:
     """Слушает ли адрес только эту машину.
 
@@ -119,6 +142,7 @@ class LocalLLMTranslator(Translator):
         context_mode: str = "event_page_1_1",
         glossary_version: str = "",
         allow_remote: bool = False,
+        min_free_ram_mb: int = MIN_FREE_RAM_MB,
         session: Any = None,
     ):
         self.base_url = (base_url or DEFAULT_BASE_URL).rstrip("/")
@@ -135,6 +159,7 @@ class LocalLLMTranslator(Translator):
         self.repair_retries = max(0, int(repair_retries))
         self.context_mode = context_mode
         self.glossary_version = glossary_version
+        self.min_free_ram_mb = max(0, int(min_free_ram_mb))
         self._session = session
 
         if not self.model:
@@ -305,6 +330,7 @@ class LocalLLMTranslator(Translator):
         """
         if not items:
             return []
+        self._check_memory()
         self.stats["items"] += len(items)
 
         ids = [it.id for it in items]
@@ -358,6 +384,21 @@ class LocalLLMTranslator(Translator):
                 self.failures.append((item.id, item.text, problems))
                 out.append("")
         return out
+
+    def _check_memory(self) -> None:
+        """Не начинать новый пакет, если памяти почти не осталось."""
+        if not self.min_free_ram_mb:
+            return
+        free = available_ram_mb()
+        if free is None or free >= self.min_free_ram_mb:
+            return
+        raise TranslationError(
+            f"Свободно всего {free:.0f} МиБ оперативной памяти "
+            f"(порог {self.min_free_ram_mb} МиБ). Новый пакет не начат: "
+            "закройте лишние программы или уменьшите размер пакета. "
+            "Переведённое уже сохранено в кэше — запуск продолжится с этого места.",
+            self.name, False,
+        )
 
     def _repair(self, item: TranslationItem, src: str, dst: str) -> str:
         """Один ремонтный запрос по одному элементу. Пусто = не починили."""
@@ -484,12 +525,18 @@ class LocalLLMTranslator(Translator):
         report["sample"] = mapping.get("probe-1", "")
         report["ok"] = True
         report["seconds"] = time.monotonic() - started
+        report["free_ram_mb"] = available_ram_mb()
         report["message"] = (
             f"Готово. Модель «{self.model}» отвечает по контракту "
             f"({report['seconds']:.1f} с). Пример: {report['sample']!r}"
         )
         if not report["loopback"]:
             report["message"] += "  ВНИМАНИЕ: адрес не локальный."
+        if report["free_ram_mb"] is None:
+            report["message"] += ("  Сторож памяти выключен: поставьте psutil, "
+                                  "чтобы перевод останавливался до подкачки.")
+        else:
+            report["message"] += f"  Свободно ОЗУ: {report['free_ram_mb']:.0f} МиБ."
         return report
 
 

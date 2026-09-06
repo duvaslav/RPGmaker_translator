@@ -1037,6 +1037,48 @@ def test_llm_receives_isolated_per_item_context():
     assert_equal(sent[1]["context_before"], ["Line one."], "контекст не отправлен")
 
 
+def test_llm_memory_guard_stops_before_swapping():
+    """§13: новый пакет не начинается, когда памяти почти не осталось.
+
+    Модель на 4 млрд параметров занимает при работе около 12.7 ГиБ приватной
+    памяти. На машине с 16 ГиБ уход в подкачку вешает не только перевод, но и
+    рабочий стол; остановиться на границе пакета — единственный безопасный
+    выход, тем более что переведённое уже лежит в кэше.
+    """
+    import core.local_llm as local_llm
+    from core.llm_contract import TranslationItem
+    from core.translators import TranslationError
+
+    items = [TranslationItem(id="i1", text="Hi")]
+    original = local_llm.available_ram_mb
+    try:
+        local_llm.available_ram_mb = lambda: 400.0
+        with MockLLMServer([_reply([("i1", "Привет")])]) as server:
+            tr = local_llm.LocalLLMTranslator(base_url=server.base_url)
+            try:
+                tr.translate_items(items, "en", "ru")
+                raise AssertionError("пакет начат при нехватке памяти")
+            except TranslationError as e:
+                assert_equal("оперативной памяти" in str(e), True, f"текст: {e}")
+                assert_equal(e.recoverable, False, "повтор при нехватке памяти")
+            assert_equal(len(server.requests), 0, "запрос всё-таки ушёл")
+
+        # Памяти достаточно — работаем как обычно.
+        local_llm.available_ram_mb = lambda: 8000.0
+        with MockLLMServer([_reply([("i1", "Привет")])]) as server:
+            tr = local_llm.LocalLLMTranslator(base_url=server.base_url)
+            assert_equal(tr.translate_items(items, "en", "ru"), ["Привет"], "перевод")
+
+        # Измерить нечем (psutil не установлен) — сторож молчит, а не мешает.
+        local_llm.available_ram_mb = lambda: None
+        with MockLLMServer([_reply([("i1", "Привет")])]) as server:
+            tr = local_llm.LocalLLMTranslator(base_url=server.base_url)
+            assert_equal(tr.translate_items(items, "en", "ru"), ["Привет"],
+                         "сторож заблокировал работу без psutil")
+    finally:
+        local_llm.available_ram_mb = original
+
+
 def test_llm_request_shape_follows_the_protocol():
     """§16: параметры запроса — те, что признаны безопасными в испытаниях."""
     from core.local_llm import LocalLLMTranslator, DEFAULT_SYSTEM_PROMPT
@@ -1100,6 +1142,7 @@ TESTS = [
     test_llm_probe_reports_each_cause_separately,
     test_llm_receives_isolated_per_item_context,
     test_llm_request_shape_follows_the_protocol,
+    test_llm_memory_guard_stops_before_swapping,
 ]
 
 
